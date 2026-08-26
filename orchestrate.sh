@@ -363,7 +363,7 @@ run_stage() {
     --permission-mode acceptEdits \
     --append-system-prompt "$(cat "$PROMPTS/_contract.md")" \
     | tee "$stream" \
-    | jq --unbuffered -r '
+    | jq --unbuffered -Rr 'fromjson? // empty |
         select(.type? == "assistant") | .message.content[]? |
         if .type == "tool_use" then
           "  ⚙ \(.name)  \((.input.file_path // .input.command // .input.pattern // .input.description // "") | tostring | .[0:90])"
@@ -379,7 +379,19 @@ run_stage() {
   # 전부의 전제다 — 한도를 올리는 것도 초과가 로그에 남아야 안전해진다).
   #
   # 스트림 마지막의 result 이벤트 = 기존 --output-format json 이 주던 것과 같은 오브젝트
-  jq -s '[.[] | select(.type? == "result")] | last' "$stream" > "$out" 2>/dev/null || true
+  jq -Rn '[inputs | fromjson? | select(.type? == "result")] | last' "$stream" > "$out" 2>/dev/null || true
+
+  # stream-json 은 NDJSON 인데, claude 가 JSON 이 아닌 줄을 stdout 으로 흘릴 때가 있다
+  # (2026-08-26 실측: MCP 서버의 "Client.listTools() called but server does not advertise
+  # tools capability" 경고가 6번째 줄에 섞였다). jq 의 기본 파서는 그 한 줄에 죽고,
+  # 그러면 tee 와 claude 가 SIGPIPE 로 연달아 죽는다 — 멀쩡히 일하던 $5 짜리 verify 가
+  # 그렇게 날아갔다. 게다가 위 result 추출도 같은 줄에서 죽어 사인조차 안 남았다.
+  # 두 곳 다 fromjson? 으로 관용 파싱하되, **버린 줄은 세어서 보고한다** —
+  # 조용히 넘기면 다음에 같은 일이 나도 원인을 못 찾는다.
+  local junk
+  junk=$(grep -cv '^{' "$stream" 2>/dev/null || true)
+  [ "${junk:-0}" -gt 0 ] \
+    && log "  ⚠ 스트림에 JSON 아닌 줄 ${junk}개 — 무시하고 진행 (원문: $stream)"
 
   # 모델 교체 감시는 **죽은 경로에서도** 돈다. 다른 모델이 돌다 상한에 닿은 것이라면,
   # 사람이 "이 산출물을 신뢰할까"를 판단할 때 그 사실을 알아야 한다. 예전엔 크래시가

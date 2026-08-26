@@ -1,0 +1,4 @@
+# 셸 스크립트는 LF 여야 한다. CRLF 로 체크아웃되면 `#!/usr/bin/env bash\r` 를
+# 찾다가 실패하거나 `set -euo pipefail\r` 로 깨진다.
+*.sh text eol=lf
+test/fake-claude text eol=lf

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "class-watcher"
+version = "0.1.0"
+description = "수업 중 코드 변경을 감시하고 종료 시 1회 요약해 Discord 로 보내는 학습 기록 도구"
+requires-python = ">=3.11"
+# PRD 가 이름으로 지목한 것만 넣는다. difflib·hashlib·pathlib 는 표준 라이브러리라
+# 여기 없다 (FR-020 이 difflib 단일화를 결정한 이유이기도 하다).
+dependencies = [
+    "watchdog>=4",       # FR-011, FR-016(PollingObserver)
+    "openai>=1.40",      # FR-030, FR-031(Structured Outputs strict)
+    "httpx>=0.27",       # Discord Webhook 전송
+    "python-dotenv>=1",  # FR-003
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pyinstaller>=6",    # FR-054
+]
+
+[project.scripts]
+class-watcher = "class_watcher.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ─────────────────────────────────────────────────────────────
+# 아래 [tool.*] 는 파이프라인의 검증 게이트 설정이다.
+# orchestrate.sh 의 PROTECTED 가 이 파일을 지문으로 감시한다 — 에이전트가
+# 테스트를 통과시키려고 여기를 느슨하게 만드는 것이 가장 값싼 부정행위 경로다.
+# ─────────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 수집된 테스트가 0개면 pytest 는 exit 5 로 실패한다. 그대로 둔다 —
+# 검증 단계가 테스트를 안 쓰고 넘어간 것을 게이트가 통과시키면 안 된다.
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = [".pipeline", "sessions", "build", "dist", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+exclude = ["^\\.pipeline/", "^sessions/", "^build/", "^dist/"]

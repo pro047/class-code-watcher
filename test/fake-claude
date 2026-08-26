@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# 가짜 claude — API를 태우지 않고 orchestrate.sh 의 게이트를 검증한다.
+#
+# PATH 앞에 이 파일이 든 디렉토리를 놓으면 orchestrate.sh 가 이걸 대신 부른다.
+# FAKE_SCENARIO 환경변수로 에이전트의 "행동"을 흉내낸다.
+#
+#   ok            정상 (STATUS: DONE)
+#   no_status     산출물은 쓰는데 STATUS 라인을 빼먹음
+#   no_file       산출물 자체를 안 씀
+#   blocked       STATUS: BLOCKED 로 올림
+#   agent_error   is_error=true
+#   crash         프로세스가 0이 아닌 코드로 죽음
+#   crash_with_artifact  STATUS: DONE 산출물을 쓰고 사인(result 이벤트)을 남긴 뒤 죽음
+#                        — 부검이 사인을 뽑고 사람 게이트를 띄워야 정상
+#   crash_no_result      산출물도 result 이벤트도 없이 죽음
+#                        — 부검이 "사인 확인 불가"를 정직하게 남겨야 정상
+#   crash_blocked        STATUS: BLOCKED 산출물을 쓴 뒤 죽음
+#                        — 막힌 이유가 사람에게 가야 정상 (exit 3, die 아님)
+#   crash_swapped        다른 모델이 돌았다고 보고하며 산출물 쓰고 죽음
+#                        — 죽은 경로에서도 MODEL_LOG 에 남아야 정상
+#   model_swap    다른 모델이 돌았다고 보고
+#   impl_fail     구현은 되는데 테스트가 깨지는 코드를 씀
+#   impl_protected   구현이 보호 파일(pyproject.toml 등)을 수정함 — 게이트 5가 막아야 정상
+#   verify_protected 검증이 pyproject.toml 의 [tool.*] 를 고쳐 테스트를 무르게 만듦 — 같은 게이트
+#   judge_clean   판단 검증이 미확인·반박 0 으로 통과
+#   judge_flagged 판단 검증이 반박을 올림 (사람 게이트가 떠야 정상)
+#   judge_nocount 판단 검증이 UNVERIFIED/REFUTED 라인을 빼먹음 (게이트 위반)
+#
+# 단계별로 다르게 하려면 FAKE_SCENARIO_<STAGE> 를 쓴다. 예: FAKE_SCENARIO_IMPL=no_status
+
+set -uo pipefail
+
+# ── 인자에서 --model / 단계별 상한 뽑기
+MODEL="unknown"; TURNS="?"; BUDGET="?"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model)          MODEL="$2";  shift 2 ;;
+    --max-turns)      TURNS="$2";  shift 2 ;;
+    --max-budget-usd) BUDGET="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+PROMPT="$(cat)"
+
+# ── 프롬프트에서 산출물 경로와 단계 이름 추출
+#
+# 두 가지 프롬프트 형식을 다 받아야 한다:
+#   1) '## 출력' 섹션을 먼저 쓰는 형식 (SKILL.md §3 이 권하는 쪽 — 입력을 먼저
+#      길게 말하면 에이전트가 그걸 산출물로 착각해 설계를 덮어쓴 실패가 있었다)
+#   2) 산출물을 마지막에 말하는 형식 (design/impl/verify 골격 프롬프트)
+#
+# 1을 먼저 찾고 없으면 2로 떨어진다. 순서 하나에 의존하면(구 버전은 tail 만 봤다)
+# 형식이 다른 프롬프트가 들어오는 순간 스텁이 **입력 파일을 산출물로 오인해서**
+# 무관한 케이스들이 전부 이상한 곳에서 죽는다. 실제로 판단검증 단계 추가 때 겪었다.
+ARTIFACT="$(awk '/^## 출력/{f=1;next} f&&/\.pipeline\//{print;exit}' <<<"$PROMPT" \
+            | grep -o '[^ `]*\.pipeline/[^ `]*/[A-Z]*\.md' | head -1)"
+[ -n "$ARTIFACT" ] \
+  || ARTIFACT="$(grep -o '[^ `]*\.pipeline/[^ `]*/[A-Z]*\.md' <<<"$PROMPT" | tail -1)"
+STAGE="$(basename "${ARTIFACT:-UNKNOWN.md}" .md)"   # DESIGN / JUDGE / IMPL / VERIFY
+
+# JUDGE 는 기본 시나리오가 다르다. 전역 FAKE_SCENARIO=ok 로 돌 때 judge 산출물에
+# 카운트 라인이 없으면 파이프라인이 게이트 위반으로 죽어서, 무관한 케이스가 전부
+# 이 단계에서 멈춘다. ok 는 'judge_clean' 과 같은 뜻으로 다룬다.
+DEFAULT_SC=ok
+[ "$STAGE" = "JUDGE" ] && DEFAULT_SC=judge_clean
+
+# ── 시나리오 결정 (단계별 > 전역 > 기본)
+var="FAKE_SCENARIO_${STAGE}"
+SC="${!var:-${FAKE_SCENARIO:-$DEFAULT_SC}}"
+# 전역 ok 가 JUDGE 에 그대로 오면 카운트 없는 산출물이 되므로 여기서도 바꿔준다.
+[ "$STAGE" = "JUDGE" ] && [ "$SC" = "ok" ] && SC=judge_clean
+
+# ── 받은 인자를 남긴다
+# 단계마다 다른 모델·상한이 실제로 전달되는지 테스트가 확인할 근거.
+# 스트림 이벤트에 싣지 않는 이유: crash 시나리오는 아무 이벤트도 안 내는데,
+# 그때도 "무엇을 받고 죽었는지"는 남아야 한다.
+if [ -n "$ARTIFACT" ]; then
+  mkdir -p "$(dirname "$ARTIFACT")"
+  printf 'model=%s turns=%s budget=%s\n' "$MODEL" "$TURNS" "$BUDGET" \
+    > "$(dirname "$ARTIFACT")/$STAGE.args"
+fi
+
+emit() {  # emit <is_error> <reported_model>
+  # stream-json 은 NDJSON 이다 — 한 줄에 이벤트 하나.
+  # 진행 표시가 뽑아 쓰는 assistant 이벤트를 먼저 흘리고, 마지막에 result 를 낸다.
+  cat <<EOF
+{"type":"assistant","message":{"content":[{"type":"text","text":"fake $STAGE 작업 시작"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"$ARTIFACT"}}]}}
+{"type":"result","subtype":"success","is_error":$1,"result":"fake run: $STAGE / $SC","session_id":"fake-$STAGE","total_cost_usd":0.01,"duration_ms":100,"num_turns":2,"model":"$2"}
+EOF
+}
+
+write_artifact() {  # write_artifact <status-block>
+  [ -n "$ARTIFACT" ] || return 0
+  mkdir -p "$(dirname "$ARTIFACT")"
+  { printf '%s\n' "$1"; echo; echo "(fake $STAGE 산출물 — 시나리오 $SC)"; } > "$ARTIFACT"
+}
+
+case "$SC" in
+  ok)
+    write_artifact "STATUS: DONE"
+    emit false "$MODEL" ;;
+
+  no_status)
+    write_artifact "완료했습니다! 모든 작업이 성공적으로 끝났습니다."
+    emit false "$MODEL" ;;
+
+  no_file)
+    emit false "$MODEL" ;;
+
+  blocked)
+    write_artifact "STATUS: BLOCKED
+BLOCKED_REASON: 인증 방식이 설계에 없음
+BLOCKED_NEEDS: JWT 인지 세션 쿠키인지 결정 필요"
+    emit false "$MODEL" ;;
+
+  agent_error)
+    emit true "$MODEL" ;;
+
+  crash)
+    echo "fake crash" >&2
+    exit 1 ;;
+
+  crash_with_artifact)
+    # 에이전트가 산출물을 다 쓴 **뒤** 더 검증하려다 상한에 닿은 상황.
+    # 실제로 2026-08-24 judge 가 이랬다 — JUDGE.md 는 완성본이었는데 셸이 버렸다.
+    write_artifact "STATUS: DONE
+UNVERIFIED: 0 REFUTED: 0"
+    cat <<EOF
+{"type":"assistant","message":{"content":[{"type":"text","text":"fake $STAGE 산출물 작성 완료"}]}}
+{"type":"result","subtype":"error_max_turns","is_error":true,"errors":["Reached maximum turns"],"result":"fake crash after artifact","session_id":"fake-$STAGE","total_cost_usd":4.72,"duration_ms":100,"num_turns":41,"terminal_reason":"turns_exhausted","model":"$MODEL"}
+EOF
+    exit 1 ;;
+
+  crash_blocked)
+    write_artifact "STATUS: BLOCKED
+BLOCKED_REASON: 예산 상한 직전에 막힘
+BLOCKED_NEEDS: 스키마를 바꿔도 되는지 결정 필요"
+    cat <<EOF
+{"type":"result","subtype":"error_max_budget_usd","is_error":true,"errors":["Reached maximum budget"],"result":"blocked then died","session_id":"fake-$STAGE","total_cost_usd":5.08,"duration_ms":100,"num_turns":34,"terminal_reason":"budget_exhausted","model":"$MODEL"}
+EOF
+    exit 1 ;;
+
+  crash_swapped)
+    write_artifact "STATUS: DONE
+UNVERIFIED: 0 REFUTED: 0"
+    cat <<EOF
+{"type":"result","subtype":"error_max_turns","is_error":true,"errors":["Reached maximum turns"],"result":"swapped then died","session_id":"fake-$STAGE","total_cost_usd":3.1,"duration_ms":100,"num_turns":41,"terminal_reason":"turns_exhausted","model":"claude-opus-4-8"}
+EOF
+    exit 1 ;;
+
+  crash_no_result)
+    # 스트림이 중간에 끊긴 상황. 사인이 없다는 사실 자체가 기록돼야 한다.
+    echo '{"type":"assistant","message":{"content":[{"type":"text","text":"작업 중"}]}}'
+    echo "fake: 스트림이 끊김" >&2
+    exit 1 ;;
+
+  model_swap)
+    write_artifact "STATUS: DONE"
+    emit false "claude-opus-4-8" ;;   # 요청과 다른 모델이 돈 상황
+
+  judge_clean)
+    write_artifact "STATUS: DONE
+UNVERIFIED: 0 REFUTED: 0"
+    emit false "$MODEL" ;;
+
+  judge_flagged)
+    write_artifact "STATUS: DONE
+UNVERIFIED: 2 REFUTED: 1"
+    emit false "$MODEL" ;;
+
+  judge_nocount)
+    # STATUS 는 맞는데 기계가 읽는 카운트 라인이 없다 — 게이트 2 는 통과하고
+    # 판단 검증 게이트에서 죽어야 한다.
+    write_artifact "STATUS: DONE"
+    emit false "$MODEL" ;;
+
+  verify_protected)
+    write_artifact "STATUS: DONE"
+    # 통과시키려고 러너 설정을 고치는 부정행위. 검증 단계에서만 재현한다.
+    [ "$STAGE" = "VERIFY" ] && echo 'addopts = "--co -q"' >> pyproject.toml
+    emit false "$MODEL" ;;
+
+  impl_protected)
+    write_artifact "STATUS: DONE"
+    # PRD·프롬프트가 못박은 보호 파일을 건드린 상황. 구현 단계에서만 재현한다.
+    [ "$STAGE" = "IMPL" ] && echo 'added-dep = "1.0.0"' >> pyproject.toml
+    emit false "$MODEL" ;;
+
+  impl_fail)
+    write_artifact "STATUS: DONE"
+    # 테스트를 깨뜨릴 흔적을 남긴다 (테스트 스크립트가 이 파일을 본다)
+    [ "$STAGE" = "IMPL" ] && touch "$(dirname "$ARTIFACT")/BROKEN"
+    emit false "$MODEL" ;;
+
+  *)
+    echo "알 수 없는 시나리오: $SC" >&2
+    exit 99 ;;
+esac

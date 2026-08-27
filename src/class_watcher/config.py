@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # PRD 10.2 는 "언어별 기본 allowlist" 라고만 쓰고 열거하지 않는다. FR-004 가 "문서화된 기본값"을
-# 요구하므로 여기서 확정한다. *.json·*.md 는 lock 파일·문서 노이즈 때문에 뺐다 (--include 로 덮어쓴다).
+# 요구하므로 여기서 확정한다. *.json·*.md 는 lock 파일·문서 노이즈 때문에 뺐다
+# (--include 로 덮어쓴다).
 DEFAULT_INCLUDE: tuple[str, ...] = (
     "*.py",
     "*.java",

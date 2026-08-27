@@ -39,13 +39,71 @@ PY=.venv/Scripts/python ./orchestrate.sh <feature-name>
 # GATE_TOOLS_OVERRIDE="Bash(...)"  게이트 명령 허용 목록 교체
 ```
 
-산출물은 `.pipeline/<feature>/` 아래 `DESIGN.md`, `JUDGE.md`, `IMPL.md`, `VERIFY.md`, `STATE.md`, `FAIL_LOG.md`, `MODEL_LOG.md` 로 남는다 (`.gitignore` 대상 — 커밋되지 않는다).
-`STATE.md` 는 셸이 자동 생성한다 — **사람이 편집하지 말 것.**
+주행 산출물은 `.pipeline/<feature>/` 아래에 남는다. **커밋되지 않는다** — 자세한 것은 2.1 절.
 
 검증 게이트 3종: `pytest`, `ruff check .`, `mypy src`.
 pytest는 수집 테스트가 0개면 exit 5로 실패한다 — 검증 단계가 테스트를 안 쓰고 넘어가는 걸 막으려는 의도적 설계다.
 
 **게이트 판정권은 셸에 있다.** 에이전트가 "통과했다"고 쓴 문장은 읽지 않고 `run_verify` 가 직접 돌려 판정한다.
+
+### 2.1 `.pipeline/` — 주행 산출물과 증거
+
+`orchestrate.sh` 가 `.pipeline/<feature>/` 에 전부 쌓는다. **`.gitignore` 대상이라 커밋되지
+않고, 돌린 PC 에만 있다.**
+
+| 파일 | 성격 | 누가 쓰나 |
+|---|---|---|
+| `DESIGN.md` | 설계. 첫 줄이 `STATUS:` | design 단계 |
+| `JUDGE.md` | 설계 주장 감사. 둘째 줄이 `UNVERIFIED: n REFUTED: n` | judge 단계 |
+| `IMPL.md` | 구현 결과 + **다음 단계 인계 노트** | impl 단계 |
+| `VERIFY.md` | 테스트 목록 + **사람 확인 체크리스트** | verify 단계 |
+| `STATE.md` | 실시간 상태. 상담역·런처가 읽는 유일한 창구 | **셸이 자동 생성 — 사람이 편집하지 말 것** |
+| `FAIL_LOG.md` | append-only 실패 기록. impl 이 "이전에 왜 실패했나"의 입력으로 읽는다 | 셸 |
+| `MODEL_LOG.md` | 요청 모델 vs 실제 실행 모델 | 셸 |
+| `<파일>.approved` | 승인 마커. 대상 파일의 sha256 을 담는다 | **사람만** (`approve.sh`) |
+| `<단계>.stream.jsonl` | 에이전트 주행 원시 스트림 (NDJSON) | 셸 |
+| `<단계>.result.json` | 스트림 마지막 result 이벤트. 비용·턴·사인·`permission_denials` | 셸 |
+
+**증거 보관 규칙** — 재시도가 이전 증거를 덮지 않는다. 고정 이름은 유지하고 덮어쓰기 직전에
+번호로 민다:
+
+- `<단계>.attempt<n>.*` — 재시도로 밀려난 이전 주행
+- `<단계>.ratelimit<n>.*` — 레이트 리밋으로 모델을 갈아타기 전의 주행 (결함 ① 수정이 만든다)
+- `<산출물>.crashed` — 프로세스는 죽었지만 산출물이 `STATUS: DONE` 이라 파킹된 것.
+  **사람이 `mv` 로 되살리는 행위 자체가 승인이다**
+
+용량은 `.md` 문서가 157KB, `*.jsonl` 원시 스트림이 **6.6MB** 다. 스트림이 거의 전부다.
+
+**진단할 때 여기를 본다.** 이번 프로젝트에서 하네스 결함 5건을 전부 이 파일들로 규명했다:
+
+```bash
+# 단계가 왜 죽었나 — 비용·턴·사인
+jq -r '"turns=\(.num_turns) cost=\(.total_cost_usd) reason=\(.terminal_reason)"' <단계>.result.json
+
+# 에이전트가 실행하려다 거부당한 것 (결함 ② 를 찾은 방법)
+jq -r '.permission_denials[].tool_input.command' <단계>.result.json
+
+# 레이트 리밋 신호 (결함 ① 판정 함수와 같은 조건)
+jq -Rn '[inputs|fromjson?|select(.type?=="rate_limit_event" and .rate_limit_info?.status?=="rejected")]|length' <단계>.stream.jsonl
+
+# 에이전트가 실제로 부른 도구 순서
+jq -Rr 'fromjson? // empty | select(.type?=="assistant") | .message.content[]?
+        | select(.type=="tool_use") | "\(.name) \(.input.file_path // .input.command // "")"' <단계>.stream.jsonl
+```
+
+**다른 PC 로 넘어갈 때 딸려오지 않는다.** 실무상 의미:
+
+- 승인 마커가 없으므로 **그 PC 에서 게이트를 다시 통과시켜야 한다** (`approve.sh` 재실행).
+  마커는 파일 해시에 묶여 있어 어차피 옮겨도 내용이 같아야만 유효하다
+- `DESIGN.md`/`JUDGE.md` 재사용도 안 된다 — 같은 feature 를 이어서 돌리면 **설계부터 다시 뽑는다**
+- **새 feature 로 시작하는 단계에는 영향이 없다.** 2단계는 `diff-engine` 이라 무관하다
+- 지난 단계의 인계 노트를 다시 봐야 하면 그 PC 로 가거나, 필요한 `.md` 만 따로 옮겨라
+  (`.md` 는 157KB 라 가볍다. `*.jsonl` 은 6.6MB 이고 진단용이라 옮길 이유가 거의 없다)
+
+> **커밋 대상으로 바꾸지 마라.** 매 주행마다 수 MB 씩 늘고, 스트림에는 프롬프트 전문과
+> 파일 내용이 그대로 들어 있다. `.gitignore` 첫 줄이 그래서 `.pipeline/` 이다.
+> 특정 주행의 판단 근거를 남기고 싶으면 그 내용을 `HANDOFF.md` 나 커밋 메시지로 옮겨라 —
+> 이 문서 3절의 주행 기록이 그 방식이다.
 
 ## 3. 지금 어디까지 왔나
 
@@ -322,9 +380,8 @@ py -3.14 -m venv .venv                    # 3.11 이상이면 됨
 & "C:\Program Files\Git\bin\bash.exe" ./approve.sh <feature> DESIGN.md
 ```
 
-`.pipeline/` 도 커밋되지 않는다 — 지난 주행의 `DESIGN/JUDGE/IMPL/VERIFY.md` 와 승인 마커는
-학원 PC 에만 있다. **2단계는 새 feature 이름으로 시작하므로 문제되지 않는다.**
-1단계 산출물을 다시 봐야 하면 학원 PC 의 `.pipeline/watch-engine/` 에 있다.
+`.pipeline/` 도 커밋되지 않는다. 1단계 산출물(`.pipeline/watch-engine/`)과 승인 마커는
+학원 PC 에만 있다 — **2단계는 새 feature 이므로 문제되지 않는다.** 자세한 것은 2.1 절.
 
 ### 그 밖의 환경 사실
 

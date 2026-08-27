@@ -45,6 +45,18 @@ PY="${PY:-python}"
 TEST_CMD_OVERRIDE="${TEST_CMD:-}"
 TEST_CMD="${TEST_CMD:-$PY -m pytest}"
 
+# ── 검증 명령 시간 상한 ──────────────────────────────
+# 게이트 명령 하나가 영원히 안 돌아오면 파이프라인이 조용히 매달린다. 죽는 것보다
+# 나쁘다 — 죽으면 FAIL_LOG 라도 남는데, 매달리면 사람이 알아채기 전까지 아무것도 없다.
+#
+# 2026-08-27 실측(watch-engine 1단계): impl 이 `run_watch` 를 진짜 감시 루프로 바꾸자
+# 0단계가 남긴 테스트 3개가 Ctrl+C 를 영원히 기다리게 됐다. `pytest` 전체가 멈췄고,
+# 타임아웃이 없었다면 run_verify 가 거기서 무한정 서 있었을 것이다. 감시 루프·네트워크
+# 대기처럼 블로킹하는 코드를 다루는 단계부터는 이게 예외가 아니라 기본값이다.
+#
+# 초 단위. 0 이면 상한 없음(예전 동작).
+VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-300}"
+
 # ── 게이트 명령 실행 허용 ────────────────────────────
 # `-p` 는 비대화형이라 승인할 사람이 없다. --permission-mode acceptEdits 는 Write/Edit 만
 # 자동 승인하고 Bash·PowerShell 은 승인을 요구한다. 그래서 에이전트가 pytest·ruff·mypy 를
@@ -201,6 +213,7 @@ ${next:-진행 중 — 개입 불필요. 이 파일을 다시 읽으면 최신 �
 - 타입 게이트(mypy): $bg
 - 린트 게이트(ruff): $lg
 - 검증 명령: $VERIFY_LIST_DESC
+- 명령별 시간 상한: ${VERIFY_TIMEOUT}초
 - 마지막 결과: ${VERIFY_LAST:-(아직 실행 안 함)}
 
 ## 지금까지 생성된 산출물
@@ -711,6 +724,16 @@ build_verify_list() {
 # 재시도 횟수만큼 곱해지는 순수 낭비이기도 하다.
 run_verify() {
   local cmd rc=0
+  # timeout 이 없는 체크아웃(coreutils 없는 macOS 등)에서도 돌아야 한다. 상한을 못 걸면
+  # 조용히 넘기지 말고 그 사실을 로그에 남긴다 — 나중에 매달렸을 때 이유를 찾을 수 있게.
+  local VERIFY_RUNNER='eval'
+  if [ "${VERIFY_TIMEOUT:-0}" -gt 0 ]; then
+    if command -v timeout >/dev/null 2>&1; then
+      VERIFY_RUNNER="timeout -k 10 $VERIFY_TIMEOUT bash -c"
+    else
+      log "  ⚠ timeout(1) 이 없어 검증 명령에 시간 상한을 걸지 못한다 — 무한 대기 시 파이프라인이 멈춘다"
+    fi
+  fi
   VERIFY_PASSED=""
   VERIFY_FAILED=""
   : > "$WORK/test_out.txt"
@@ -718,14 +741,21 @@ run_verify() {
   for cmd in "${VERIFY_CMDS[@]}"; do
     log "  ▸ $cmd"
     echo "### \$ $cmd" >> "$WORK/test_out.txt"
-    if (cd "$ROOT" && eval "$cmd") >> "$WORK/test_out.txt" 2>&1; then
+    if (cd "$ROOT" && $VERIFY_RUNNER "$cmd") >> "$WORK/test_out.txt" 2>&1; then
       echo "→ 통과" >> "$WORK/test_out.txt"
       echo >> "$WORK/test_out.txt"
       VERIFY_PASSED="$VERIFY_PASSED${VERIFY_PASSED:+, }$cmd"
     else
       rc=$?
-      VERIFY_FAILED="$cmd"
-      echo "→ 실패 (exit $rc)" >> "$WORK/test_out.txt"
+      # timeout(1) 은 상한 초과를 124 로 알린다. 이걸 그냥 "실패"로 뭉개면 다음 시도의
+      # impl 이 FAIL_LOG 를 읽고 "테스트가 틀렸구나"로 오해한다 — 실제로는 안 돌아온 것이다.
+      if [ "$rc" -eq 124 ]; then
+        VERIFY_FAILED="$cmd (${VERIFY_TIMEOUT}초 시간 초과 — 명령이 돌아오지 않았다)"
+        echo "→ 시간 초과 ($VERIFY_TIMEOUT초). 무한 대기하는 테스트를 의심하라." >> "$WORK/test_out.txt"
+      else
+        VERIFY_FAILED="$cmd"
+        echo "→ 실패 (exit $rc)" >> "$WORK/test_out.txt"
+      fi
       return 1
     fi
   done

@@ -1,9 +1,9 @@
 # 핸드오프 — Class Code Watcher
 
 - 기준 문서: `PRD.md` v1.1.1 (14절 MVP 단계별 개발 계획)
-- 갱신 시점: 2026-08-27
-- 기준 커밋: `bbcc316` (main)
-- 한 줄 요약: **0단계 "골격" 완료 — 게이트 3종 녹색. 다음은 1단계 "감시"(PRD 최대 단계, 2일).**
+- 갱신 시점: 2026-08-27 (학원 PC에서 push, 집에서 이어감)
+- 기준 커밋: `9f8c03c` (main)
+- 한 줄 요약: **0·1단계 완료 — 테스트 119개, 게이트 3종 녹색. 다음은 2단계 "Diff"(0.5일).**
 
 ---
 
@@ -63,24 +63,29 @@ pytest는 수집 테스트가 0개면 exit 5로 실패한다 — 검증 단계�
 | `092594a` | **0단계 테스트 61 케이스 — 게이트 3종 통과. 0단계 완료** |
 | `a1bc96f` | 핸드오프 갱신 |
 | `bbcc316` | **레이트 리밋 거부를 셸이 감지해 폴백 체인으로 갈아탄다** (아래 참조) |
+| `962f532` | 검증 명령 시간 상한 (결함 ④) |
+| `bc702e7` | 낡은 테스트 교착 해소 — impl 인계 예외 (결함 ⑤) |
+| `9f8c03c` | **1단계 감시 엔진 — 테스트 119개, 게이트 3종 통과. 1단계 완료** |
 
-### 0단계 산출물
+### 0·1단계 산출물 — 소스 11모듈 / 테스트 119개
 
-소스 4모듈 562줄 + 테스트 4파일 695줄.
-
-| 파일 | 줄 | 내용 |
+| 소스 | 단계 | 역할 |
 |---|---|---|
-| `src/class_watcher/cli.py` | 248 | argparse(`watch` + PRD 10.2 옵션 12개), `build_config`, `run_preflight`, `bootstrap`, `main`, EXIT 4종. **`run_watch` 는 스텁** |
-| `src/class_watcher/config.py` | 140 | 기본값 상수, `WatchConfig`, `Secrets`(repr/str 차단), `load_secrets`, `merge_env`, `mask_secrets` |
-| `src/class_watcher/selector.py` | 62 | `Selection`, `is_watched`(순수 판정), `scan_files` |
-| `src/class_watcher/session.py` | 107 | `SessionStatus` 6종, `generate_session_id`, `SessionPaths`, `write_session_json`(원자적 교체) |
-| `tests/test_cli.py` | 308 | 파서, `build_config`, `run_preflight`, `bootstrap`, 종료 코드, argparse SystemExit 환원 |
-| `tests/test_config.py` | 135 | 기본 상수, Secrets 차단, `merge_env`, `mask_secrets` |
-| `tests/test_selector.py` | 113 | `is_watched` 순수 판정, `scan_files` |
-| `tests/test_session.py` | 139 | 상태 6종, id 생성, 원자적 교체 |
+| `cli.py` | 0→1 | argparse(10.2 옵션 12개), preflight, bootstrap, **`run_watch` 실물** |
+| `config.py` | 0→1 | 기본값, `WatchConfig`, `Secrets`, `mask_secrets`, FR-014 상수 3종 |
+| `selector.py` | 0 | `is_watched`(순수), `scan_files` |
+| `session.py` | 0→1 | `SessionStatus` 6종, 원자적 `write_session_json`, `history_dir` |
+| `debounce.py` | 1 | 병합 판정 — **시계 주입 순수 상태 기계** |
+| `stability.py` | 1 | FR-014 안정화 — stat·clock·sleep 주입 |
+| `watchmode.py` | 1 | FR-016 native/polling 판별 — 순수 판정 + 어댑터 주입 |
+| `eventlog.py` | 1 | FR-041 — 행 구성(순수) + append(부작용) 분리 |
+| `snapshot.py` | 1 | baseline/final/history, SHA-256, meta |
+| `watcher.py` | 1 | watchdog 배선·감시 루프·finalize (**부작용 층, 얇게**) |
 
-**게이트 실측 (2026-08-27):** `pytest` 61 passed / `ruff` All checks passed / `mypy` no issues.
-PRD 14절 0단계 완료 기준("잘못된 입력·정상 시작의 자동 테스트") 충족.
+테스트 10파일 1968줄 / **119 케이스**. `test_watcher.py` 가 518줄로 가장 크다 —
+Observer 를 띄우지 않고 이벤트 정규화·finalize 판정만 검사한다.
+
+**게이트 실측 (2026-08-27):** `pytest` 119 passed / `ruff` All checks passed / `mypy` 11 files.
 
 ### 파이프라인 주행 기록 — 두 번 죽고 세 번째에 닫혔다
 
@@ -138,46 +143,71 @@ impl 은 자기가 뭘 어겼는지 볼 수 없었다 — 눈을 가린 채 린�
 | 단계 | 범위 | 완료 기준 | 예상 | 상태 |
 |---|---|---|---|---|
 | **0. 골격** | CLI, 설정, 세션 디렉터리, 로깅 | 잘못된 입력/정상 시작의 자동 테스트 | 0.5일 | ✅ **완료** (`092594a`) |
-| **1. 감시** | baseline(다중 파일), watchdog, debounce, flush+안정화, final | 저장·원자적 교체·삭제/재생성·신규 파일 시나리오 통과 | **2일** | ⬜ **다음 차례** |
-| 2. Diff | difflib, 바이너리/대용량 제외, 파일별·합산 통계 | 다중 파일 fixture 결과 검증 | 0.5일 | ⬜ 미착수 |
+| **1. 감시** | baseline(다중 파일), watchdog, debounce, flush+안정화, final | 저장·원자적 교체·삭제/재생성·신규 파일 시나리오 통과 | **2일** | ✅ **완료** (`9f8c03c`) |
+| **2. Diff** | difflib, 바이너리/대용량 제외, 파일별·합산 통계 | 다중 파일 fixture 결과 검증 | 0.5일 | ⬜ **다음 차례** |
 | 3. 정제 | secret scanner, 경로 상대화, 환경정보 제거 | 키 패턴 fixture 전량 탐지, 마스킹 테스트 | 0.5일 | ⬜ 미착수 |
 | 4. LLM | 프롬프트, strict schema, 1회 호출 + 1회 재시도, fallback | mock 기반 호출 횟수·스키마·timeout 테스트 | 1일 | ⬜ 미착수 |
 | 5. Discord | 메시지 렌더링, 모바일 가독성, Webhook, 실패 보존 | 204/4xx/5xx mock 테스트 | 0.5일 | ⬜ 미착수 |
 | 6. 통합 | 상태 전이, 종료 코드, 마스킹 E2E | E2E 10회 연속 성공, 오류별 산출물 검증 | 1일 | ⬜ 미착수 |
 | 7. 배포 | PyInstaller 단일 exe, `.env` 템플릿, USB 실행 검증 | Python 없는 PC에서 실행 성공 | 0.5일 | ⬜ 미착수 |
 
-합계 6.5일 중 0.5일 완료 — **약 8%**.
+합계 6.5일 중 2.5일 완료 — **약 38%**.
 
 부수 체크리스트는 아직 전량 미완이다:
 - PRD 14.1 MVP 테스트 체크리스트 **19항목** — 0단계 범위 밖 항목이 대부분이라 그대로다
 - PRD 18절 DoD **7조건** 전부 미충족
 
-## 5. 다음에 할 일 — 1단계 "감시"
+## 5. 다음에 할 일
 
-PRD 14절에서 **가장 큰 단계(2일)**다. 여기서 `cli.run_watch` 스텁이 실물이 된다.
+### (가) 사람만 할 수 있는 것 — 1단계 실기기 확인 6건
 
-범위: baseline 다중 파일 스냅샷, watchdog 이벤트, debounce(기본 750ms), flush+안정화, final 스냅샷.
-완료 기준: 저장·원자적 교체·삭제/재생성·신규 파일 시나리오 통과.
+`VERIFY.md` 5절의 체크리스트다. watchdog 실이벤트·신호·실기기 의존이라 테스트로 못 덮는다.
+**2단계로 넘어가기 전에 최소 1·2·3번은 해보는 것이 좋다** — 감시 엔진이 실제로 도는지
+아무도 아직 확인하지 않았다.
 
-관련 FR: FR-014(저장 중 Ctrl+C 에도 안정 상태), FR-016(네트워크 드라이브 폴링 전환), FR-017(세션 중 신규 파일).
+1. **실제 IDE 저장 감지** — `class-watcher watch <폴더>` 실행 후 VS Code 에서 Ctrl+S 연타
+   → 콘솔에 `변경 감지` 가 **저장 묶음당 1건**(debounce 병합). IntelliJ(임시파일→rename)도 확인
+2. **Ctrl+C 안전 종료** — 저장 직후 Ctrl+C → `[FINALIZING]` 후 종료.
+   `final/<파일>` 이 마지막 저장본과 바이트 동일, `final/.meta.json` 의 `unstable` 이 `false`
+3. **두 번째 Ctrl+C → 130** — 빠르게 두 번 → `[ABORTED]`, `$LASTEXITCODE` 가 130,
+   `session.json` 이 `status: failed` + `error: aborted_by_user`
+4. **폴링 자동 전환** (judge #23·#24 미확인 해소) — 네트워크 드라이브(`Z:` 매핑)와
+   OneDrive 폴더에서 `watch_mode` 가 `polling` 이 되는지. `GetDriveTypeW` 가 4 를 반환하는지,
+   개인+업무 OneDrive 병용 머신에서 `Get-ChildItem env:OneDrive*` 로 변수명 3종 실재 확인
+5. **Ctrl+C 반응 시간** (judge #25) — 유휴 상태에서 ≤0.2초. 수 초 걸리면
+   `watcher.py:38` `LOOP_TIMEOUT_S` 확인
+6. **자원 사용** — 200파일 1시간 감시에 CPU 2% 이하 / 메모리 150MB 이하
+
+### (나) 2단계 "Diff" (0.5일)
+
+difflib, 바이너리/대용량 제외, 파일별·합산 통계. 완료 기준은 다중 파일 fixture 결과 검증.
 
 ```bash
-PY=.venv/Scripts/python ./orchestrate.sh watch-engine
+BUDGET_JUDGE=8 BUDGET_VERIFY=10 PY=.venv/Scripts/python ./orchestrate.sh diff-engine
 ```
 
-**시작 전 준비물 — 둘 다 이미 해소됐다:**
+**예산 근거**: 기본값 `BUDGET_JUDGE=5`·`BUDGET_VERIFY=5` 는 0단계 실측으로 정한 값이고
+1단계에서 둘 다 그 상한에서 죽었다. 1단계 실적은 judge $5.61 / verify $3.88 이다.
+2단계는 1단계보다 작으므로 위 값이면 충분하다.
 
-1. ~~폴백 체인이 레이트 리밋을 못 받는 문제~~ → **고쳤다** (`bbcc316`, 7절).
-2. ~~watchdog 의존성~~ → **이미 있다.** `pyproject.toml:14` 에 `watchdog>=4` 가 선언돼 있고
-   6.0.0 이 설치돼 있다. `openai`·`httpx`·`python-dotenv`·`pyinstaller` 도 전부 깔려 있어
-   **1~7단계 전 구간에서 `PROTECTED` 때문에 사람이 개입할 일이 없다.**
-   이 환경에서 `Observer` 는 `WindowsApiObserver`(ReadDirectoryChangesW)로 해석되고
-   `PollingObserver`(FR-016)도 정상 import 된다 — 설계가 알아야 할 사실이다.
+**과도기 매핑 주의**: 변경 있음 세션은 지금 `partial` + `summary_pipeline_not_implemented`
++ 코드 1 이다. 2~5단계가 구현되면 `test_main_changed_session_ends_partial`,
+`test_changed_session_is_partial_and_preserves_artifacts`,
+`test_status_transitions_end_partial_when_changed` 의 단언을 새 매핑으로 갱신해야 한다.
 
-**설계 단계에서 미리 못박아 둘 것**: DESIGN.md 의 "검증 기준"에 [테스트 가능] 항목을 충분히 넣어야 한다.
-verify 는 그 목록을 pytest 로 옮기는 일만 한다. 0단계에서 24개 → 61 케이스가 나왔다.
-watchdog 의 실제 파일시스템 이벤트는 OS·타이밍·백신에 의존해 불안정하므로,
-`prompts/verify.md:30` 이 경고한 대로 **판정 함수를 순수하게 떼어내 테스트 가능하게** 설계해야 한다.
+**`_drain_queue` 의존**: `test_cli.py` 의 통합 3건이 `watcher._drain_queue(sink, debouncer)`
+패치에 의존한다. 감시 루프 구조를 바꾸면 깨지고, 그때는 `KeyboardInterrupt` 주입 지점만
+옮기면 된다.
+
+### (다) 별건 — cp949 콘솔에서 죽는 결함 (0단계 코드)
+
+`src/class_watcher/cli.py:131` (`run_preflight` 의 `--max-files` 초과 안내)에 em dash `—` 가
+있다. 한국어 Windows 콘솔에 실제로 출력되면 `UnicodeEncodeError: 'cp949' codec` 로 **죽는다**.
+impl 이 이 세션에서 같은 예외를 재현했고, 이 문서를 쓰던 스크립트도 같은 이유로 한 번 죽었다.
+
+기존 테스트가 못 잡는다 — `capsys` 는 실제 콘솔 인코딩을 타지 않는다.
+**FR-006 은 P0 이고 그 안내 경로가 실제 사용 환경에서 죽는다.** 설계 범위 밖이라 impl 이
+손대지 않았다. 2단계에 끼워 넣든 별도로 처리하든 사람이 정해야 한다.
 
 ## 6. 이미 내려진 결정 — 다시 논쟁하지 말 것
 
@@ -191,7 +221,7 @@ watchdog 의 실제 파일시스템 이벤트는 OS·타이밍·백신에 의존
 | — | 게이트 명령(`pytest`·`ruff`·`mypy`)은 에이전트가 **승인 없이 실행**한다 | 안 열면 에이전트가 자기 산출물을 검증할 수 없다. 세 모듈로만 못박았고 판정권은 여전히 셸에 있다 (`1e7fe58`) |
 | — | 0단계의 ruff E501 은 **파이프라인 밖에서** 고쳤다 | 재시도에 ~$13 이 드는데 고칠 대상이 주석 한 줄이었다. 근본 원인(권한)은 같은 주행에서 고쳤다. **1단계부터는 파이프라인 안에서 닫는다** |
 
-## 7. 하네스 결함 4건 — 전부 이 저장소에서만 고쳐졌다
+## 7. 하네스 결함 5건 — 전부 이 저장소에서만 고쳐졌다
 
 `orchestrate.sh` 는 DMS 프로젝트에서 포팅한 것이고, **이 머신에 사본이 3개 있다.**
 
@@ -207,6 +237,7 @@ watchdog 의 실제 파일시스템 이벤트는 OS·타이밍·백신에 의존
 | ② | 에이전트가 pytest·ruff·mypy 를 실행하지 못한다 | ✅ `1e7fe58` | ❌ 있음 |
 | ③ | 스트림의 비-JSON 줄 하나에 단계가 통째로 죽는다 | ✅ `f475c9a` | ❌ 있음 |
 | ④ | 검증 명령이 안 돌아오면 파이프라인이 조용히 매달린다 | ✅ `962f532` | ❌ 있음 |
+| ⑤ | 낡은 테스트가 impl 을 막으면 verify 가 시작조차 못 하는 교착 | ✅ `bc702e7` | ❌ 있음 |
 
 **셋 다 CLI 버그가 아니라 하네스 결함이다.** ①만 봐도 `--fallback-model` 의 문서화된 범위는
 "overloaded or not available" 인데, 하네스가 그걸 유일한 안전망으로 삼았다.
@@ -217,10 +248,21 @@ watchdog 의 실제 파일시스템 이벤트는 OS·타이밍·백신에 의존
 죽으면 `FAIL_LOG` 라도 남는데 매달리면 아무것도 안 남는다. 감시 루프·네트워크 대기를
 다루는 단계부터는 예외가 아니라 기본값이다.
 
+**⑤도 1단계에서 실제로 밟았다.** impl 은 테스트를 못 고치고(프롬프트 금지), 고칠 수 있는
+것은 verify 다. 그런데 루프가 `impl → verify` 순서라 impl 이 `BLOCKED` 를 올리면
+**verify 가 시작조차 못 한다** — 아무도 고칠 수 없는 교착이다. 소스는 완결됐고
+`ruff check src`·`mypy src` 가 통과하는데도 파이프라인이 멈췄다.
+`prompts/impl.md` 에 "낡은 테스트" 예외를, `prompts/verify.md` 에 할 일 0번을 넣어 끊었다.
+
 **②가 가장 조용하고 비싸다.** ①③은 죽어서 눈에 보이지만 ②는 에이전트가 자기 산출물을
 검증하지 못한 채 "통과할 것"이라고 추측만 하게 만든다. 셸의 `run_verify` 가 최종 판정을
 하니 틀린 코드가 통과하지는 않지만, **재시도가 늘어나고 그게 전부 돈이다** — 이 저장소에서
 impl 이 주석 한 줄을 두 주행 내내 못 고친 것이 그 증거다.
+
+**5건 전부 실전에서 작동을 확인했다** (1단계 주행 로그):
+①은 `fable-5 → opus-5 → sonnet-5` 두 번 갈아탐, ②는 impl 이 게이트를 직접 돌려 조건 판정,
+③은 `스트림에 JSON 아닌 줄 1개 — 무시하고 진행`, ④는 impl 의 pytest 가 300초에 끊겨 진단 가능,
+⑤는 `BLOCKED` 대신 `DONE` + 인계.
 
 **다른 두 사본은 아직 안 고쳤다.** 별도 세션에 맡길 프롬프트가 `docs/HARNESS_SYNC_PROMPT.md` 에 있다.
 
@@ -229,9 +271,13 @@ impl 이 주석 한 줄을 두 주행 내내 못 고친 것이 그 증거다.
 
 ## 8. 다음 세션이 놀라지 않으려면
 
-- **정상 경로에서 `main(["watch", str(tmp)])` 는 `1` 을 반환한다.** `run_watch` 가 스텁이라 `session.json` 을
-  `status="failed"`, `error="not_implemented"` 로 갱신하고 `EXIT_RUNTIME` 을 돌려준다. 버그가 아니라 0단계의 정의된 동작이다.
-  **1단계가 이걸 바꾼다** — 관련 테스트도 같이 갱신해야 한다.
+- **`run_watch` 는 이제 스텁이 아니다.** 종료 코드 매핑은 `aborted`→130, `no_change`→0,
+  변경 있음→1, 감시 중 `OSError`→1(`error="watch_io_error"`) 이다. 변경 있음 세션의
+  `partial` + `error="summary_pipeline_not_implemented"` 은 **과도기 매핑**이고
+  2~5단계가 구현되면 바뀐다 (5절 참조).
+- **테스트에서 `cli.main(["watch", <디렉터리>])` 를 그냥 부르면 안 돌아온다.** 진짜 감시
+  루프라 Ctrl+C 를 기다린다. `watcher._drain_queue` 를 패치해 종료를 주입하는 방식이
+  `test_cli.py` 에 이미 있으니 그걸 따라라.
 - 세션 디렉터리(`<session_dir>/<id>/` + `baseline/` + `final/` + `session.json`)는 생성되지만
   `events.jsonl`·`errors.jsonl` 은 **경로만 정의하고 파일을 만들지 않는다.**
 - preflight 실패(경로 없음 / 파일 / 읽기 불가 / 파일 수 상한 초과)는 `EXIT_CONFIG=2`, 이때
@@ -240,9 +286,10 @@ impl 이 주석 한 줄을 두 주행 내내 못 고친 것이 그 증거다.
   에이전트가 건드리면 즉시 죽는다. **의존성 추가는 사람이 미리 해야 한다.**
 - 판정 함수(`run_preflight` 등)에는 `print` 가 없다. 콘솔 출력은 `main` 에서만 한다.
 - verify 는 `tests/test_*.py` 만 수정할 수 있다 (`prompts/verify.md:62`). **소스의 린트·타입 오류는 impl 만 고칠 수 있다.**
-- 콘솔 한글이 cp949 로 깨진다 (`class-watcher --help`). 기능 문제는 아니지만 PRD 10.1 의 사용자 경험과 어긋난다 — 언젠가 볼 것.
-- JUDGE 미확인 2건(Windows `os.replace` 원자성, `secrets.token_hex(2)` 가 소문자 hex 4자)은
-  이제 61개 테스트가 실제로 돌면서 간접 확인됐다.
+- 0단계 JUDGE 미확인 2건(Windows `os.replace` 원자성, `token_hex(2)`)은 119개 테스트가
+  실제로 돌면서 간접 확인됐다. 1단계 미확인 3건은 **아직 열려 있다** — 5절 (가) 4·5번이
+  그것을 푸는 절차다.
+- 콘솔 한글이 cp949 로 깨지는 정도가 아니라 **죽는 경로가 하나 있다** — 5절 (다).
 
 ## 9. 오픈 이슈 (PRD 17.1)
 
@@ -253,11 +300,39 @@ impl 이 주석 한 줄을 두 주행 내내 못 고친 것이 그 증거다.
    5세션에서 반복되면 "경고 후 확인"으로 완화 재검토.
 4. **알림 빈도** — 하루 여러 세션이면 채널이 시끄러워진다. 그 시점에 주간 다이제스트(P2) 앞당김.
 
-## 10. 환경
+## 10. 환경 — 다른 PC 에서 이어받을 때
 
-- Python 3.14.6 (`.venv/pyvenv.cfg`), `requires-python >=3.11`
-- editable 설치됨 — `.venv/Scripts/class-watcher.exe` 존재, 진입점 `class_watcher.cli:main`
-- 비밀값 2개: `OPENAI_API_KEY`, `DISCORD_WEBHOOK_URL` (`.env.example` 참조, `.env` 는 커밋 안 됨)
-- 공용 PC 에서는 `.env` 를 PC 에 남기지 말고 exe 와 함께 USB 에 둔다 (FR-054)
+`.venv/` 는 커밋되지 않는다 (`.gitignore`). 새 PC 에서는 이렇게 시작한다:
+
+```powershell
+git clone https://github.com/pro047/class-code-watcher.git
+cd class-code-watcher
+py -3.14 -m venv .venv                    # 3.11 이상이면 됨
+.venv\Scripts\python -m pip install -e ".[dev]"
+.venv\Scripts\python -m pytest -q       # 119 passed 나와야 정상
+```
+
+`.env` 도 커밋되지 않는다. 1~3단계는 외부 호출이 없어 없어도 되고, 4단계(LLM)부터
+`.env.example` 을 복사해 채워야 한다.
+
+**파이프라인은 bash 가 필요하다.** PowerShell 에서는 이렇게 부른다:
+
+```powershell
+& "C:\Program Files\Git\bin\bash.exe" ./orchestrate.sh <feature>
+& "C:\Program Files\Git\bin\bash.exe" ./approve.sh <feature> DESIGN.md
+```
+
+`.pipeline/` 도 커밋되지 않는다 — 지난 주행의 `DESIGN/JUDGE/IMPL/VERIFY.md` 와 승인 마커는
+학원 PC 에만 있다. **2단계는 새 feature 이름으로 시작하므로 문제되지 않는다.**
+1단계 산출물을 다시 봐야 하면 학원 PC 의 `.pipeline/watch-engine/` 에 있다.
+
+### 그 밖의 환경 사실
+
+- Python 3.14.6 (학원 PC), `requires-python >=3.11`
+- 의존성은 `pyproject.toml` 에 전부 선언돼 있다 — watchdog 6.0.0, openai, httpx,
+  python-dotenv, (dev) pytest·ruff·mypy·pyinstaller. **`PROTECTED` 라 에이전트가 못 건드린다**
+- 이 환경에서 `Observer` 는 `WindowsApiObserver`(ReadDirectoryChangesW)로 해석된다
+- 비밀값 2개: `OPENAI_API_KEY`, `DISCORD_WEBHOOK_URL`. 공용 PC 에서는 `.env` 를 PC 에
+  남기지 말고 exe 와 함께 USB 에 둔다 (FR-054)
 - 모델 배치: design·judge·verify = `claude-fable-5`, impl = `claude-opus-5`
-- 예산: design/judge/verify $5, impl $8. 턴: design/judge/verify 40, impl 80
+- 예산 실적: 0단계 impl $1.3~5.2 / verify $4.8. 1단계 judge $5.6 / impl $2.5 / verify $3.9

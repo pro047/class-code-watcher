@@ -346,6 +346,26 @@ EOF
   return 0
 }
 
+# ─────────────────────────────────────────── 레이트 리밋 판정
+# rate_limited <stream> <result.json>
+#
+# --fallback-model 은 "과부하·부재"만 받는다 (CLI --help 원문: "when the default
+# model is overloaded or not available"). 주간·5시간 창이 소진돼 거부되면 그 플래그는
+# 아무것도 하지 않고 단계가 그냥 죽는다 — 2026-08-26 실측: FALLBACK_VERIFY 에
+# opus-5·sonnet-5 가 있었는데도 fable-5 에서 죽었고 폴백을 한 번도 시도하지 않았다.
+# 그래서 리밋 거부는 셸이 직접 감지한다. 신호 두 개 중 하나면 참으로 본다:
+#   ① rate_limit_event.rate_limit_info.status == "rejected"
+#   ② assistant 메시지의 error == "rate_limit" (합성 안내 메시지)
+# terminal_reason 은 보조로만 쓴다 — 없는 버전이 있을 수 있다.
+rate_limited() {
+  local stream=$1 out=$2
+  jq -Rn '[inputs | fromjson?
+           | select((.type? == "rate_limit_event"
+                     and (.rate_limit_info?.status? == "rejected"))
+                 or (.error? == "rate_limit"))] | length' "$stream" 2>/dev/null \
+    | grep -qvx '0'
+}
+
 # ─────────────────────────────────────────── 단계 실행기
 # run_stage <이름> <모델> <폴백체인> <프롬프트파일> <산출물경로>
 #
@@ -384,38 +404,63 @@ run_stage() {
   local art_before="NONE"
   if [ -f "$artifact" ]; then art_before="$(file_hash "$artifact")"; fi
 
-  state "RUNNING:$name" "model=$model, 턴≤$turns, 예산≤\$$budget"
-  log "▶ $name (model=$model, fallback=$fallback, 턴≤$turns, 예산≤\$$budget)"
+  # 모델 체인 순환. 첫 항목으로 돌리고, 레이트 리밋 거부로 죽으면 다음 항목으로
+  # 갈아탄다. 리밋이 아닌 실패(예산·턴 초과, 에이전트 에러)는 갈아타지 않는다 —
+  # 그건 모델을 바꾼다고 나아지는 실패가 아니고, 조용히 다른 모델로 재주행하면
+  # MODEL_LOG 가 감시하려던 "다른 모델이 돌았다"를 셸이 스스로 만들어내는 꼴이 된다.
+  local chain try_model rest swap=0
+  chain="$model${fallback:+,$fallback}"
 
-  set +e
-  envsubst < "$prompt_file" | claude -p \
-    --model "$model" \
-    --fallback-model "$fallback" \
-    --output-format stream-json \
-    --verbose \
-    --max-turns "$turns" \
-    --max-budget-usd "$budget" \
-    --permission-mode acceptEdits \
-    --allowedTools "$GATE_TOOLS" \
-    --append-system-prompt "$(cat "$PROMPTS/_contract.md")" \
-    | tee "$stream" \
-    | jq --unbuffered -Rr 'fromjson? // empty |
-        select(.type? == "assistant") | .message.content[]? |
-        if .type == "tool_use" then
-          "  ⚙ \(.name)  \((.input.file_path // .input.command // .input.pattern // .input.description // "") | tostring | .[0:90])"
-        elif .type == "text" and ((.text // "") | length) > 0 then
-          "  💬 \(.text | gsub("\\s+"; " ") | .[0:160])"
-        else empty end' >&2
-  code=${PIPESTATUS[1]}   # [0]=envsubst [1]=claude [2]=tee [3]=jq — 판정 기준은 claude
-  set -e
+  while :; do
+    try_model="${chain%%,*}"
+    rest="${chain#*,}"; [ "$rest" = "$chain" ] && rest=""
 
-  # 사인을 먼저 확보한다 — exit code 검사보다 **앞**이다. claude 가 0 이 아닌 코드로
-  # 죽어도 스트림 마지막 result 이벤트에는 이유가 들어 있다. 예전엔 순서가 반대라
-  # 그 파일을 손에 쥐고도 exit code 숫자 하나만 보고 버렸다 (진단 가능성이 나머지
-  # 전부의 전제다 — 한도를 올리는 것도 초과가 로그에 남아야 안전해진다).
-  #
-  # 스트림 마지막의 result 이벤트 = 기존 --output-format json 이 주던 것과 같은 오브젝트
-  jq -Rn '[inputs | fromjson? | select(.type? == "result")] | last' "$stream" > "$out" 2>/dev/null || true
+    state "RUNNING:$name" "model=$try_model, 턴≤$turns, 예산≤\$$budget"
+    log "▶ $name (model=$try_model, fallback=${rest:-없음}, 턴≤$turns, 예산≤\$$budget)"
+
+    set +e
+    envsubst < "$prompt_file" | claude -p \
+      --model "$try_model" \
+      ${rest:+--fallback-model "$rest"} \
+      --output-format stream-json \
+      --verbose \
+      --max-turns "$turns" \
+      --max-budget-usd "$budget" \
+      --permission-mode acceptEdits \
+      --allowedTools "$GATE_TOOLS" \
+      --append-system-prompt "$(cat "$PROMPTS/_contract.md")" \
+      | tee "$stream" \
+      | jq --unbuffered -Rr 'fromjson? // empty |
+          select(.type? == "assistant") | .message.content[]? |
+          if .type == "tool_use" then
+            "  ⚙ \(.name)  \((.input.file_path // .input.command // .input.pattern // .input.description // "") | tostring | .[0:90])"
+          elif .type == "text" and ((.text // "") | length) > 0 then
+            "  💬 \(.text | gsub("\\s+"; " ") | .[0:160])"
+          else empty end' >&2
+    code=${PIPESTATUS[1]}   # [0]=envsubst [1]=claude [2]=tee [3]=jq — 판정 기준은 claude
+    set -e
+
+    # 사인을 먼저 확보한다 — exit code 검사보다 **앞**이다. claude 가 0 이 아닌 코드로
+    # 죽어도 스트림 마지막 result 이벤트에는 이유가 들어 있다. 예전엔 순서가 반대라
+    # 그 파일을 손에 쥐고도 exit code 숫자 하나만 보고 버렸다 (진단 가능성이 나머지
+    # 전부의 전제다 — 한도를 올리는 것도 초과가 로그에 남아야 안전해진다).
+    #
+    # 스트림 마지막의 result 이벤트 = 기존 --output-format json 이 주던 것과 같은 오브젝트
+    jq -Rn '[inputs | fromjson? | select(.type? == "result")] | last' "$stream" > "$out" 2>/dev/null || true
+    # 아직 안 써본 모델이 남아 있고 리밋으로 죽었을 때만 갈아탄다.
+    if [ -z "$rest" ] || ! rate_limited "$stream" "$out"; then break; fi
+
+    swap=$((swap + 1))
+    mv "$stream" "$WORK/$name.ratelimit$swap.stream.jsonl" 2>/dev/null || true
+    mv "$out"    "$WORK/$name.ratelimit$swap.result.json"  2>/dev/null || true
+    log "  ⚠ $try_model 레이트 리밋 거부 — ${rest%%,*} 로 갈아탄다 (증거: $name.ratelimit$swap.*)"
+    fail_log "$name: $try_model 레이트 리밋 거부 — ${rest%%,*} 로 전환" <<EOF
+--fallback-model 은 과부하·부재만 받는다. 창 소진 거부는 셸이 감지해 갈아탄다.
+증거: $WORK/$name.ratelimit$swap.stream.jsonl
+EOF
+    chain="$rest"
+  done
+
 
   # stream-json 은 NDJSON 인데, claude 가 JSON 이 아닌 줄을 stdout 으로 흘릴 때가 있다
   # (2026-08-26 실측: MCP 서버의 "Client.listTools() called but server does not advertise
@@ -433,8 +478,8 @@ run_stage() {
   # 사람이 "이 산출물을 신뢰할까"를 판단할 때 그 사실을 알아야 한다. 예전엔 크래시가
   # 이 블록을 통째로 건너뛰어 MODEL_LOG 에 그 단계 줄이 아예 안 남았다.
   if [ "$(jq -r 'type' "$out" 2>/dev/null)" = "object" ]; then
-    if [ "$code" -eq 0 ]; then check_model_swap "$name" "$out" "$model" 1
-    else                       check_model_swap "$name" "$out" "$model" 0
+    if [ "$code" -eq 0 ]; then check_model_swap "$name" "$out" "$try_model" 1
+    else                       check_model_swap "$name" "$out" "$try_model" 0
     fi
   fi
 

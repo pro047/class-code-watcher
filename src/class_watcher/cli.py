@@ -36,8 +36,10 @@ from .session import (
     generate_session_id,
     initial_session_doc,
     make_session_paths,
+    transition,
     write_session_json,
 )
+from .watcher import run_session
 
 # PRD 10.3 의 4종.
 EXIT_OK = 0
@@ -156,14 +158,45 @@ def bootstrap(
 
 
 def run_watch(preflight: Preflight, paths: SessionPaths, secrets: Secrets) -> int:
-    """감시 루프가 들어올 자리. 지금은 되는 척하지 않고 실패로 기록하고 끝낸다."""
-    doc: dict[str, object] = json.loads(paths.session_json.read_text(encoding="utf-8"))
-    doc["status"] = SessionStatus.FAILED.value
-    doc["error"] = "not_implemented"
-    write_session_json(paths, doc)
-    _emit_error("[FAILED] 감시 기능은 아직 구현되지 않았습니다.", secrets)
+    """감시 세션을 돌리고 결과를 종료 코드로 환원한다 (PRD 10.3).
+
+    세션 상태 기록은 watcher 쪽이 이미 끝낸다. 여기서는 코드 매핑과 콘솔 마무리만 한다.
+    """
+    try:
+        outcome = run_session(
+            preflight.config,
+            paths,
+            preflight.selection,
+            lambda message: _emit(message, secrets),
+        )
+    except OSError as exc:
+        _record_failure(paths, "watch_io_error")
+        _emit_error(f"[FAILED] 감시 중 실패: {exc}", secrets)
+        _emit_error(f"       세션 산출물은 보존됩니다: {paths.root}", secrets)
+        return EXIT_RUNTIME
+
+    if outcome.aborted:
+        _emit_error(f"[ABORTED] 세션 산출물은 보존됩니다: {paths.root}", secrets)
+        return EXIT_ABORTED
+
+    if outcome.unstable:
+        _emit("[WARN] 일부 파일이 안정되지 않아 마지막 관측 상태를 사용했습니다.", secrets)
+
+    if outcome.no_change:
+        _emit(f"[DONE] 변경 없음: 요약과 전송을 생략합니다. {paths.root}", secrets)
+        return EXIT_OK
+
+    changed = sum(1 for status in outcome.statuses.values() if status != "unchanged")
+    _emit(f"[OK] 변경 {changed}개 파일 / 이벤트 {outcome.logical_event_count}건", secrets)
+    _emit_error("[FAILED] 요약·전송 단계는 아직 구현되지 않았습니다.", secrets)
     _emit_error(f"       세션 산출물은 보존됩니다: {paths.root}", secrets)
     return EXIT_RUNTIME
+
+
+def _record_failure(paths: SessionPaths, error: str) -> None:
+    """감시 도중 죽은 경우의 최종 상태 기록 (FR-040, PRD 12절)."""
+    doc: dict[str, object] = json.loads(paths.session_json.read_text(encoding="utf-8"))
+    write_session_json(paths, transition(doc, SessionStatus.FAILED, error=error))
 
 
 def _emit(message: str, secrets: Secrets) -> None:

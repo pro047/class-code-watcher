@@ -48,6 +48,8 @@ class SessionPaths:
     final_dir: Path
     events_jsonl: Path
     errors_jsonl: Path
+    # `--history` 일 때만 실제로 만들어진다 (PRD 9.1).
+    history_dir: Path
 
 
 def make_session_paths(session_dir: Path, session_id: str) -> SessionPaths:
@@ -59,6 +61,7 @@ def make_session_paths(session_dir: Path, session_id: str) -> SessionPaths:
         final_dir=root / "final",
         events_jsonl=root / "events.jsonl",
         errors_jsonl=root / "errors.jsonl",
+        history_dir=root / "history",
     )
 
 
@@ -81,6 +84,16 @@ def write_session_json(paths: SessionPaths, doc: dict[str, object]) -> None:
     except BaseException:
         Path(tmp_name).unlink(missing_ok=True)
         raise
+
+
+def transition(
+    doc: dict[str, object], status: SessionStatus, **fields: object
+) -> dict[str, object]:
+    """순수 — 상태와 추가 필드를 얹은 새 doc 을 만든다. 쓰기는 write_session_json 이 한다."""
+    updated = dict(doc)
+    updated["status"] = status.value
+    updated.update(fields)
+    return updated
 
 
 def initial_session_doc(

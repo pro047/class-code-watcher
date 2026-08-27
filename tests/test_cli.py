@@ -4,17 +4,19 @@ import argparse
 import json
 import re
 import socket
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from class_watcher import cli
+from class_watcher import cli, watcher
 from class_watcher.config import (
     DEFAULT_EXCLUDE,
     DEFAULT_INCLUDE,
     Secrets,
 )
+from class_watcher.debounce import Debouncer, RawEvent
 
 NOW = datetime(2026, 8, 26, 18, 30, 0)
 FAKE_OPENAI_KEY = "sk-test-abcdef1234567890"
@@ -187,16 +189,37 @@ def test_bootstrap_polling_flag_sets_watch_mode(tmp_path: Path) -> None:
     assert doc["watch_mode"] == "polling"
 
 
-# ── 통합: 정상 트리에서 main → run_watch 스텁이 실패를 정직하게 기록 ─────────
+# ── 통합: 정상 트리에서 main → 감시 루프 → finalize 가 끝까지 돈다 ───────────
+#
+# 감시 루프는 Ctrl+C 전까지 반환하지 않으므로, 루프 심장인 `_drain_queue` 를 패치해
+# 스크립트를 소진하면 KeyboardInterrupt(1회차)를 흉내낸다. watchdog Observer 는 실제로
+# 뜨고, baseline → watching → finalizing → completed/partial 전이와 산출물이 전부
+# 실제로 만들어진다 (IMPL 4.1 방식 2).
 
 
-def test_main_happy_path_records_stub_failure(
-    isolated_env: Path, capsys: pytest.CaptureFixture[str]
+def _interrupt_after(
+    monkeypatch: pytest.MonkeyPatch, steps: list[Callable[[Debouncer], None]]
+) -> None:
+    iterator = iter(steps)
+
+    def fake_drain(sink: object, debouncer: Debouncer) -> None:
+        step = next(iterator, None)
+        if step is None:
+            raise KeyboardInterrupt
+        step(debouncer)
+
+    monkeypatch.setattr(watcher, "_drain_queue", fake_drain)
+
+
+def test_main_happy_path_no_change_completes(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     tree = _make_tree(isolated_env, count=2)
     sessions = isolated_env / "sessions"
+    _interrupt_after(monkeypatch, [])
     rc = cli.main(["watch", str(tree), "--session-dir", str(sessions)])
-    assert rc == cli.EXIT_RUNTIME
+    # 변경 없음 → completed / 코드 0 (FR-035).
+    assert rc == cli.EXIT_OK
 
     session_roots = list(sessions.iterdir())
     assert len(session_roots) == 1
@@ -207,26 +230,59 @@ def test_main_happy_path_records_stub_failure(
     assert (root / "final").is_dir()
 
     doc = json.loads((root / "session.json").read_text(encoding="utf-8"))
-    assert doc["status"] == "failed"
-    assert doc["error"] == "not_implemented"
+    assert doc["status"] == "completed"
+    assert doc["no_change"] is True
+    assert "error" not in doc
+    assert doc["ended_at"]
+    assert {file["status"] for file in doc["watched_files"]} == {"unchanged"}
 
     captured = capsys.readouterr()
     assert "[OK] 감시 루트:" in captured.out
     assert "대상 2개" in captured.out
-    assert "[FAILED]" in captured.err
+    assert "[DONE] 변경 없음" in captured.out
+    # 변경 없음 경로에는 [FAILED] 가 나오지 않는다.
+    assert "[FAILED]" not in captured.err
+
+
+def test_main_changed_session_ends_partial(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tree = _make_tree(isolated_env, count=1)
+    sessions = isolated_env / "sessions"
+
+    def change(debouncer: Debouncer) -> None:
+        (tree / "file0.py").write_text("# changed\n", encoding="utf-8")
+        debouncer.observe(RawEvent(rel_path="file0.py", kind="modified", at=0.0))
+
+    _interrupt_after(monkeypatch, [change])
+    rc = cli.main(["watch", str(tree), "--session-dir", str(sessions)])
+    # 변경 있음 → 후속 파이프라인 미구현 → partial / 코드 1 (설계 4절 과도기 매핑).
+    assert rc == cli.EXIT_RUNTIME
+
+    [root] = list(sessions.iterdir())
+    doc = json.loads((root / "session.json").read_text(encoding="utf-8"))
+    assert doc["status"] == "partial"
+    assert doc["error"] == "summary_pipeline_not_implemented"
+
+    captured = capsys.readouterr()
+    assert "[FAILED] 요약·전송 단계는 아직 구현되지 않았습니다." in captured.err
 
 
 def test_main_warns_on_empty_selection_but_continues(
-    isolated_env: Path, capsys: pytest.CaptureFixture[str]
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     empty = isolated_env / "empty"
     empty.mkdir()
     sessions = isolated_env / "sessions"
+    _interrupt_after(monkeypatch, [])
     rc = cli.main(["watch", str(empty), "--session-dir", str(sessions)])
-    # 대상 0개는 오류가 아니다 — 경고 후 계속 진행해 스텁 실패(1)로 끝난다.
-    assert rc == cli.EXIT_RUNTIME
+    # 대상 0개는 오류가 아니다 — 경고 후 계속 진행하고, 변경 없음이므로 completed/0.
+    assert rc == cli.EXIT_OK
     assert "[WARN]" in capsys.readouterr().out
-    assert len(list(sessions.iterdir())) == 1
+    [root] = list(sessions.iterdir())
+    doc = json.loads((root / "session.json").read_text(encoding="utf-8"))
+    assert doc["status"] == "completed"
+    assert doc["no_change"] is True
 
 
 # ── FR-003: 환경에 키가 있어도 stderr/stdout 에 원문이 없다 ──────────────────
@@ -282,15 +338,27 @@ def test_full_run_never_touches_network(
     isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     def _forbid(*args: object, **kwargs: object) -> object:
-        raise AssertionError("bootstrap-cli 는 네트워크를 만지면 안 된다 (FR-030/FR-035)")
+        raise AssertionError("watch 세션은 네트워크를 만지면 안 된다 (FR-030/FR-035)")
 
     monkeypatch.setattr(socket, "socket", _forbid)
     monkeypatch.setattr(socket, "create_connection", _forbid)
 
     tree = _make_tree(isolated_env, count=1)
     sessions = isolated_env / "sessions"
-    # 정상 경로와 preflight 실패 경로 모두 소켓을 열지 않는다.
+
+    # ① 변경 없음 전체 세션 (감시 → finalize): OpenAI·Discord 모두 0회 (FR-035).
+    _interrupt_after(monkeypatch, [])
+    assert cli.main(["watch", str(tree), "--session-dir", str(sessions)]) == cli.EXIT_OK
+
+    # ② 저장 이벤트가 있는 세션: 이벤트 처리(해시·로그·snapshot) 중에도 호출 0회 (FR-030).
+    def change(debouncer: Debouncer) -> None:
+        (tree / "file0.py").write_text("# saved\n", encoding="utf-8")
+        debouncer.observe(RawEvent(rel_path="file0.py", kind="modified", at=0.0))
+
+    _interrupt_after(monkeypatch, [change])
     assert cli.main(["watch", str(tree), "--session-dir", str(sessions)]) == cli.EXIT_RUNTIME
+
+    # ③ preflight 실패 경로도 소켓을 열지 않는다.
     assert cli.main(["watch", str(isolated_env / "없음")]) == cli.EXIT_CONFIG
     capsys.readouterr()
 

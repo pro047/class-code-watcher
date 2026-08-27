@@ -45,6 +45,11 @@ DEFAULT_MAX_FILES: int = 200
 DEFAULT_DEBOUNCE_MS: int = 750
 DEFAULT_SESSION_DIR: str = "./sessions"
 
+# FR-014 의 정량 기준. 종료 직전 안정화 대기에만 쓴다.
+DEFAULT_STABLE_MS: int = 300  # ② (size, mtime) 연속 불변 요구 시간
+DEFAULT_STABLE_TIMEOUT_MS: int = 3000  # ③ 이 시간을 넘으면 unstable 로 기록하고 진행
+FINALIZE_ENTER_BUDGET_MS: int = 5000  # ④ 종료 흐름 진입까지의 상한
+
 # PRD 13.1 이 지정한 키 이름.
 ENV_OPENAI_API_KEY = "OPENAI_API_KEY"
 ENV_DISCORD_WEBHOOK_URL = "DISCORD_WEBHOOK_URL"

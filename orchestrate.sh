@@ -45,6 +45,41 @@ PY="${PY:-python}"
 TEST_CMD_OVERRIDE="${TEST_CMD:-}"
 TEST_CMD="${TEST_CMD:-$PY -m pytest}"
 
+# ── 게이트 명령 실행 허용 ────────────────────────────
+# `-p` 는 비대화형이라 승인할 사람이 없다. --permission-mode acceptEdits 는 Write/Edit 만
+# 자동 승인하고 Bash·PowerShell 은 승인을 요구한다. 그래서 에이전트가 pytest·ruff·mypy 를
+# **한 번도 실행하지 못한 채** "통과할 것"이라고 추측만 하고 단계를 끝낸다.
+#
+# 2026-08-26~27 실측: judge·impl·verify 세 세션 연속으로 실행 요청이 전량 거부됐다
+# (impl 5건, verify 3건 — *.result.json 의 permission_denials). 그 결과 impl 이 ruff
+# E501 한 줄을 두 주행 내내 못 고쳤다 — 자기가 뭘 어겼는지 볼 수 없었기 때문이다.
+# 눈을 가린 채 린트를 통과시키라고 시킨 셈이다.
+#
+# 게이트 명령은 읽기 전용 검사다. 승인 없이 돌게 열어 줘야 에이전트가 자기 산출물을
+# 스스로 확인한다. 최종 판정은 여전히 셸이 한다 (run_verify) — 에이전트가 "통과했다"고
+# 쓴 문장은 읽지 않는다. 허용 범위는 세 모듈로 못박는다. `$PY *` 처럼 열면 임의 파이썬
+# 실행이 되므로 그렇게 하지 않는다.
+PY_DIR="$(dirname "$PY")"
+PY_WIN="$(printf '%s' "$PY" | tr '/' '\\')"
+PY_DIR_WIN="$(printf '%s' "$PY_DIR" | tr '/' '\\')"
+GATE_TOOLS=""
+_add() { GATE_TOOLS="${GATE_TOOLS:+$GATE_TOOLS,}$1"; }
+for _mod in pytest ruff mypy; do
+  for _base in "$PY" "./$PY" "$PY.exe" "./$PY.exe"; do
+    _add "Bash($_base -m $_mod*)"
+  done
+  _add "Bash($PY_DIR/$_mod*)"
+  _add "Bash(./$PY_DIR/$_mod*)"
+  _add "PowerShell($PY_WIN -m $_mod*)"
+  _add "PowerShell(.\\$PY_WIN -m $_mod*)"
+  _add "PowerShell(& .\\$PY_WIN -m $_mod*)"
+  _add "PowerShell($PY_DIR_WIN\\$_mod*)"
+  _add "PowerShell(.\\$PY_DIR_WIN\\$_mod*)"
+done
+unset _mod _base
+# 통째로 갈아끼우려면: GATE_TOOLS_OVERRIDE="Bash(...)" ./orchestrate.sh <feature>
+GATE_TOOLS="${GATE_TOOLS_OVERRIDE:-$GATE_TOOLS}"
+
 # ── 검증 게이트 상태 ─────────────────────────────────
 # state() 가 첫 호출부터 참조하므로 여기서 초기화한다 (set -u).
 TYPE_GATE=0                        # 1 = 기준선 mypy 가 녹색이라 타입 검사를 검증에 포함
@@ -361,6 +396,7 @@ run_stage() {
     --max-turns "$turns" \
     --max-budget-usd "$budget" \
     --permission-mode acceptEdits \
+    --allowedTools "$GATE_TOOLS" \
     --append-system-prompt "$(cat "$PROMPTS/_contract.md")" \
     | tee "$stream" \
     | jq --unbuffered -Rr 'fromjson? // empty |

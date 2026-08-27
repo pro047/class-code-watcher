@@ -13,19 +13,19 @@
 이 머신에 DMS 개발 파이프라인 하네스(`orchestrate.sh`)의 사본이 3개 있다.
 
 ```
-C:/Users/ksmart/class-code-watcher/orchestrate.sh      ← 기준 구현 (Python 프로젝트). 3건 모두 수정됨
+C:/Users/ksmart/class-code-watcher/orchestrate.sh      ← 기준 구현 (Python 프로젝트). 4건 모두 수정됨
 C:/Users/ksmart/dms-auto-classify/orchestrate.sh       756줄 (Node/TypeScript). 미수정
 C:/Users/ksmart/Nyangmeong_care_dms/orchestrate.sh     756줄 (Node/TypeScript). 미수정
 ```
 
-뒤 두 사본은 **서로 완전히 동일하다**(확인됨). `class-code-watcher` 에서 결함 3건을 찾아 고쳤는데,
+뒤 두 사본은 **서로 완전히 동일하다**(확인됨). `class-code-watcher` 에서 결함 4건을 찾아 고쳤는데,
 고침이 역류할 경로가 없어 나머지 두 곳에 그대로 남아 있다.
 
 **이 세션의 일**: 결함 4건이 두 사본에 실제로 존재하는지 **먼저 검증하고**, 존재하면 이식한다.
 
 ### 먼저 읽을 것
 
-- `C:/Users/ksmart/class-code-watcher/HANDOFF.md` 7절 — 결함 3건의 배경과 실측 증거
+- `C:/Users/ksmart/class-code-watcher/HANDOFF.md` 7절 — 결함 4건의 배경과 실측 증거
 - `C:/Users/ksmart/class-code-watcher/orchestrate.sh` — 기준 구현
 
 기준 저장소의 관련 커밋:
@@ -186,11 +186,11 @@ watch 모드로 잘못 들어간 실행 등). 둘은 다른 층이므로 vitest 
 
 ## 진행 규칙
 
-1. **검증 먼저.** 3건이 실제로 존재하는지 각 사본에서 확인하고 결과를 보고할 것.
+1. **검증 먼저.** 4건이 실제로 존재하는지 각 사본에서 확인하고 결과를 보고할 것.
    이미 고쳐져 있으면 건드리지 말 것. 두 사본이 여전히 동일한지도 확인할 것
    (한쪽만 갈라졌다면 각각 다뤄야 한다).
 2. **파일을 통째로 복사하지 말 것.** 기준 구현은 Python 프로젝트용이라
-   `PY`, `pytest`, `ruff`, `mypy`, 프리플라이트가 전부 다르다. **3건만 정확히 이식한다.**
+   `PY`, `pytest`, `ruff`, `mypy`, 프리플라이트가 전부 다르다. **4건만 정확히 이식한다.**
 3. **각 수정 후 `bash -n orchestrate.sh` 로 문법 검증.** 이 스크립트는 `set -euo pipefail`
    이라 문법 오류가 조용히 지나가지 않는다.
 4. `orchestrate.sh` 외의 파일은 건드리지 말 것. 특히 각 저장소의 `PROTECTED` 목록에 있는

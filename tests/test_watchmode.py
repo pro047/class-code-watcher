@@ -4,11 +4,14 @@
 실제 네트워크 드라이브·OneDrive 없이 판정 규칙만 결정적으로 검증한다.
 """
 
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from class_watcher.watchmode import DRIVE_REMOTE, resolve_watch_mode
 
 DRIVE_FIXED = 3  # 로컬 고정 디스크 — DRIVE_REMOTE 가 아닌 아무 값
+
+# Path() resolves per host OS: on POSIX, Path("Z:/x").drive is "" and the drive-type
+# branch is skipped entirely. Parse drive-letter fixtures explicitly so these run anywhere.
 
 
 # ── 기준 17: --polling 강제 지정 → polling ───────────────────────────────────
@@ -45,7 +48,7 @@ def test_remote_drive_switches_to_polling() -> None:
         queried.append(drive_root)
         return DRIVE_REMOTE
 
-    decision = resolve_watch_mode(Path("Z:/lesson"), False, {}, drive_type_of)
+    decision = resolve_watch_mode(PureWindowsPath("Z:/lesson"), False, {}, drive_type_of)
     assert decision.mode == "polling"
     assert decision.reason is not None
     # 드라이브 루트("Z:\\" 또는 "Z:/")로 조회해야 한다 — 파일 경로 전체가 아니라.
@@ -53,7 +56,9 @@ def test_remote_drive_switches_to_polling() -> None:
 
 
 def test_local_drive_stays_native() -> None:
-    decision = resolve_watch_mode(Path("C:/lesson"), False, {}, lambda drive: DRIVE_FIXED)
+    decision = resolve_watch_mode(
+        PureWindowsPath("C:/lesson"), False, {}, lambda drive: DRIVE_FIXED
+    )
     assert decision.mode == "native"
     assert decision.reason is None
 

@@ -203,7 +203,7 @@ impl 은 자기가 뭘 어겼는지 볼 수 없었다 — 눈을 가린 채 린�
 |---|---|---|---|---|
 | **0. 골격** | CLI, 설정, 세션 디렉터리, 로깅 | 잘못된 입력/정상 시작의 자동 테스트 | 0.5일 | ✅ **완료** (`092594a`) |
 | **1. 감시** | baseline(다중 파일), watchdog, debounce, flush+안정화, final | 저장·원자적 교체·삭제/재생성·신규 파일 시나리오 통과 | **2일** | ✅ **완료** (`9f8c03c`) |
-| **2. Diff** | difflib, 바이너리/대용량 제외, 파일별·합산 통계 | 다중 파일 fixture 결과 검증 | 0.5일 | ⬜ **다음 차례** |
+| **2. Diff** | difflib, 바이너리/대용량 제외, 파일별·합산 통계 | 다중 파일 fixture 결과 검증 | 0.5일 | ⬜ **다음 차례** — 범위·판정 지점은 5절 (나) |
 | 3. 정제 | secret scanner, 경로 상대화, 환경정보 제거 | 키 패턴 fixture 전량 탐지, 마스킹 테스트 | 0.5일 | ⬜ 미착수 |
 | 4. LLM | 프롬프트, strict schema, 1회 호출 + 1회 재시도, fallback | mock 기반 호출 횟수·스키마·timeout 테스트 | 1일 | ⬜ 미착수 |
 | 5. Discord | 메시지 렌더링, 모바일 가독성, Webhook, 실패 보존 | 204/4xx/5xx mock 테스트 | 0.5일 | ⬜ 미착수 |
@@ -263,26 +263,91 @@ impl 은 자기가 뭘 어겼는지 볼 수 없었다 — 눈을 가린 채 린�
 
 6. ⬜ **자원 사용** — 200파일 1시간 감시에 CPU 2% 이하 / 메모리 150MB 이하
 
-### (나) 2단계 "Diff" (0.5일)
+### (나) 2단계 "Diff" (0.5일) — 다음 차례
 
-difflib, 바이너리/대용량 제외, 파일별·합산 통계. 완료 기준은 다중 파일 fixture 결과 검증.
+`baseline/` 과 `final/` 을 비교해 `final.diff`·`stats.json` 을 만든다. 감시는 건드리지 않는다.
+
+**범위 — PRD 12절**
+
+| FR | 내용 | 우선 | 수용 기준 |
+|---|---|---|---|
+| FR-020 | difflib 기반 unified diff 를 파일별로 생성 | P0 | git 설치·저장소 여부와 무관하게 항상 같은 형식 |
+| FR-022 | 개행·인코딩 보존 또는 명시적 정규화 | P0 | UTF-8 우선, BOM 감지, **decode 실패는 그 파일만 건너뛰고 사유 기록** (세션 전체 실패로 만들지 않는다) |
+| FR-023 | 변경 통계 — 파일별·합산 +/- 라인, 이벤트 수, 시간 | P1 | 요약·Discord 가 재사용할 구조 |
+| FR-024 | 바이너리·대용량 판별해 제외 | P0 | **NUL 바이트 포함 또는 1MB 초과 → `skipped` 기록** |
+
+C-04 로 git diff 경로는 폐기됐다. **difflib 단일 경로다** — 되살리지 말 것.
+
+**새 산출물 2개** (PRD 9.1): `final.diff`(파일별 unified diff 연결본), `stats.json`
+
+**입력은 이미 전부 있다.** 1단계가 남긴 `baseline/`·`final/`(각 `.meta.json` 에 sha256·size),
+`session.json` 의 `watched_files`(4종 status), `events.jsonl`. 새로 감시할 것이 없어서
+2단계는 순수 함수 비중이 가장 높은 단계다.
+
+**의존성 0.** `difflib`·NUL 판별·1MB 컷 전부 표준 라이브러리다 (`pyproject.toml` 주석이
+그렇게 적어뒀다). `PROTECTED` 파일을 건드릴 일이 없으므로 **사람이 미리 해둘 준비 작업이 없다.**
+
+**하네스 조건이 처음으로 온전하다.** 결함 5건이 전부 고쳐진 상태에서 도는 첫 주행이다
+(0단계는 ②③ 이 안 고쳐진 채, 1단계는 ④⑤ 를 주행 중에 밟으며 돌았다). 7절 참조.
+
+#### 깨질 테스트 1개 — 확정
+
+`test_changed_session_is_partial_and_preserves_artifacts` 의
+
+```python
+assert doc["change_stats"] == {"files_changed": 1, "events": 1}
+```
+
+PRD 9.2 의 정본은 `{"files_changed": 2, "events": 17, "added_lines": 42, "deleted_lines": 18}`
+이다. FR-023 이 붙으면 라인 수가 들어와 이 단언이 깨진다. **verify 가 고칠 수 있다**
+(`tests/test_*.py` 는 verify 담당). impl 이 여기서 `BLOCKED` 를 올리면 결함 ⑤ 의 교착이니
+`prompts/impl.md` 의 "낡은 테스트" 예외를 따라 `DONE` + 인계로 넘겨야 한다.
+
+#### 설계 단계에서 판정이 필요한 것 — judge 가 물고 늘어질 지점
+
+PRD 가 답을 안 적어둔 것들이다. DESIGN 이 근거 없이 정하면 JUDGE 가 반박한다.
+
+1. **`final.diff` 의 연결 형식** — 파일 구분자, 헤더의 경로 표기.
+   경로는 **감시 루트 기준 상대 경로**여야 한다 (FR-037 의 절대 경로·사용자명 금지가
+   3단계에서 오지만, diff 헤더에 절대 경로를 박아두면 그때 되돌려야 한다)
+2. **삭제·신규 파일의 표기** — `/dev/null` 관례를 쓸지, 별도 표기를 쓸지
+3. **1MB 기준이 baseline 인지 final 인지** — 한쪽만 넘으면 어떻게 되는가
+4. **NUL 판별 범위** — 파일 전체를 읽는가, 앞 N 바이트만 보는가 (1MB 컷과 순서도 중요하다.
+   먼저 크기로 거르면 큰 바이너리를 안 읽어도 된다)
+5. **`skipped` 를 어디에 기록하는가** — `stats.json` / `errors.jsonl` / `session.json` 중
+   어디인지 PRD 가 지정하지 않았다. 12절 오류 표는 "`skipped` 기록, 계속"까지만 말한다
+6. **개행 정규화** — CRLF/LF 혼재 시 diff 가 전 줄 변경으로 터지는 것을 어떻게 막는가.
+   **이게 실전 근거가 있는 항목이다** — 자바는 이클립스, JS 는 VS Code 로 쓰는 실사용
+   환경이 확인됐다 (5절 가). `.gitattributes` 가 있지만 그건 git 얘기고 이 도구와 무관하다
+
+#### 14.1 체크리스트에서 닫히는 것
+
+- [ ] 세션 중 생성된 신규 파일이 diff 에 포함된다 (FR-017)
+- [ ] 바이너리·1MB 초과 파일이 제외되고 세션은 계속된다 (FR-024)
+- [ ] git 설치 여부와 무관하게 `final.diff` 가 생성된다
+- [ ] 한글·영문 파일명, 공백 포함 경로, UTF-8 BOM — **BOM 부분만** (FR-022)
+
+#### 주행
 
 ```bash
 BUDGET_JUDGE=8 BUDGET_VERIFY=10 PY=.venv/Scripts/python ./orchestrate.sh diff-engine
 ```
 
+PowerShell 에서는 10절대로 `bash.exe` 를 거쳐야 한다.
+
 **예산 근거**: 기본값 `BUDGET_JUDGE=5`·`BUDGET_VERIFY=5` 는 0단계 실측으로 정한 값이고
 1단계에서 둘 다 그 상한에서 죽었다. 1단계 실적은 judge $5.61 / verify $3.88 이다.
 2단계는 1단계보다 작으므로 위 값이면 충분하다.
 
-**과도기 매핑 주의**: 변경 있음 세션은 지금 `partial` + `summary_pipeline_not_implemented`
-+ 코드 1 이다. 2~5단계가 구현되면 `test_main_changed_session_ends_partial`,
+**과도기 매핑은 2단계에서 안 바뀐다**: 변경 있음 세션은 여전히 `partial` +
+`summary_pipeline_not_implemented` + 코드 1 이다. 요약·전송은 4·5단계이므로 그때
+`test_main_changed_session_ends_partial`,
 `test_changed_session_is_partial_and_preserves_artifacts`,
-`test_status_transitions_end_partial_when_changed` 의 단언을 새 매핑으로 갱신해야 한다.
+`test_status_transitions_end_partial_when_changed` 의 단언을 새 매핑으로 갱신한다.
 
 **`_drain_queue` 의존**: `test_cli.py` 의 통합 3건이 `watcher._drain_queue(sink, debouncer)`
 패치에 의존한다. 감시 루프 구조를 바꾸면 깨지고, 그때는 `KeyboardInterrupt` 주입 지점만
-옮기면 된다.
+옮기면 된다. **2단계는 감시 루프를 건드릴 이유가 없다** — 건드리려 하면 설계가 샌 것이다.
 
 ### (다) ✅ 해결됨 — cp949 에서 죽는 결함 (0단계 코드)
 

@@ -142,6 +142,17 @@ def test_over_max_files_exits_config_with_hint(
     assert not sessions.exists()
 
 
+def test_max_files_hint_survives_cp949_console(tmp_path: Path) -> None:
+    # 콘솔 출력이 파이프·파일로 리다이렉트되면 stdout 인코딩이 cp949 가 된다.
+    # 안내 문구에 cp949 밖 문자(em dash 등)가 있으면 그 자리에서 UnicodeEncodeError 로
+    # 죽는다. capsys 는 실제 인코딩을 타지 않아 못 잡으므로 문구를 직접 인코딩해 본다.
+    tree = _make_tree(tmp_path, count=5)
+    config = cli.build_config(_parse("watch", str(tree), "--max-files", "3"), NOW)
+    with pytest.raises(cli.PreflightError) as excinfo:
+        cli.run_preflight(config)
+    str(excinfo.value).encode("cp949")
+
+
 def test_exactly_at_max_files_passes(tmp_path: Path) -> None:
     tree = _make_tree(tmp_path, count=5)
     config = cli.build_config(_parse("watch", str(tree), "--max-files", "5"), NOW)

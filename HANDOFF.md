@@ -3,8 +3,8 @@
 - 기준 문서: `PRD.md` v1.1.1 (14절 MVP 단계별 개발 계획)
 - 갱신 시점: 2026-08-28
 - 기준 커밋: `652082b` (main)
-- 한 줄 요약: **0·1단계 완료 — 테스트 119개, 게이트 3종 녹색. 실기기 확인 6건 중 4건 통과.
-  다음은 2단계 "Diff"(0.5일).**
+- 한 줄 요약: **0·1단계 완료 — 테스트 122개, 게이트 3종 녹색. 실기기 확인 6건 중 4건 통과.
+  실기기에서 나온 결함 2건도 닫았다. 다음은 2단계 "Diff"(0.5일).**
 
 ---
 
@@ -126,7 +126,7 @@ jq -Rr 'fromjson? // empty | select(.type?=="assistant") | .message.content[]?
 | `bc702e7` | 낡은 테스트 교착 해소 — impl 인계 예외 (결함 ⑤) |
 | `9f8c03c` | **1단계 감시 엔진 — 테스트 119개, 게이트 3종 통과. 1단계 완료** |
 
-### 0·1단계 산출물 — 소스 11모듈 / 테스트 119개
+### 0·1단계 산출물 — 소스 11모듈 / 테스트 122개
 
 | 소스 | 단계 | 역할 |
 |---|---|---|
@@ -141,10 +141,10 @@ jq -Rr 'fromjson? // empty | select(.type?=="assistant") | .message.content[]?
 | `snapshot.py` | 1 | baseline/final/history, SHA-256, meta |
 | `watcher.py` | 1 | watchdog 배선·감시 루프·finalize (**부작용 층, 얇게**) |
 
-테스트 10파일 1968줄 / **119 케이스**. `test_watcher.py` 가 518줄로 가장 크다 —
+테스트 10파일 1920줄 / **122 케이스**. `test_watcher.py` 가 518줄로 가장 크다 —
 Observer 를 띄우지 않고 이벤트 정규화·finalize 판정만 검사한다.
 
-**게이트 실측 (2026-08-27):** `pytest` 119 passed / `ruff` All checks passed / `mypy` 11 files.
+**게이트 실측 (2026-08-28):** `pytest` 122 passed / `ruff` All checks passed / `mypy` 11 files.
 
 ### 파이프라인 주행 기록 — 두 번 죽고 세 번째에 닫혔다
 
@@ -284,7 +284,7 @@ BUDGET_JUDGE=8 BUDGET_VERIFY=10 PY=.venv/Scripts/python ./orchestrate.sh diff-en
 패치에 의존한다. 감시 루프 구조를 바꾸면 깨지고, 그때는 `KeyboardInterrupt` 주입 지점만
 옮기면 된다.
 
-### (다) 별건 — cp949 콘솔에서 죽는 결함 (0단계 코드)
+### (다) ✅ 해결됨 — cp949 에서 죽는 결함 (0단계 코드)
 
 `src/class_watcher/cli.py:131` (`run_preflight` 의 `--max-files` 초과 안내)에 em dash `—` 가
 있다. 한국어 Windows 콘솔에 실제로 출력되면 `UnicodeEncodeError: 'cp949' codec` 로 **죽는다**.
@@ -292,7 +292,12 @@ impl 이 이 세션에서 같은 예외를 재현했고, 이 문서를 쓰던 �
 
 기존 테스트가 못 잡는다 — `capsys` 는 실제 콘솔 인코딩을 타지 않는다.
 **FR-006 은 P0 이고 그 안내 경로가 실제 사용 환경에서 죽는다.** 설계 범위 밖이라 impl 이
-손대지 않았다. 2단계에 끼워 넣든 별도로 처리하든 사람이 정해야 한다.
+손대지 않았다.
+
+> **2026-08-28 해결.** `—` 를 `.` 로 바꿨다. 회귀 테스트는
+> `test_max_files_hint_survives_cp949_console` — 실제로 발생하는 `PreflightError` 메시지를
+> `.encode("cp949")` 해 본다. `capsys` 가 못 잡는 이유(콘솔 인코딩을 안 탄다)를 우회하는
+> 가장 얇은 형태다. **고치기 전 코드에서 `UnicodeEncodeError` 로 실패하는 것을 확인했다.**
 
 **2026-08-28 실측으로 조건이 좁혀졌다.** 실기기 확인 4세션 동안 콘솔 한글은 한 번도 안 깨졌다 —
 진짜 콘솔에서는 파이썬이 `WriteConsoleW` 로 쓰므로 cp949 를 안 탄다. **죽는 건 stdout 이
@@ -305,7 +310,7 @@ impl 이 이 세션에서 같은 예외를 재현했고, 이 문서를 쓰던 �
 **즉 `cli.py:131` 의 `—` 를 `-` 로 바꾸는 한 글자 수정이면 끝난다.**
 
 
-### (라) 별건 — 중단된 세션의 `session.json` 이 "변경 없음"이라고 거짓말한다 (1단계 코드)
+### (라) ✅ 해결됨 — 중단된 세션의 `session.json` 이 "변경 없음"이라고 거짓말한다 (1단계 코드)
 
 위 (가) 3번에서 나왔다. `[ABORTED]` 로 닫힌 세션인데 `watched_files` 가 네 파일 전부
 `unchanged` 로 남았다. 같은 세션의 `events.jsonl` 은 `New.java` 변경을 기록했고
@@ -320,9 +325,16 @@ abort 분기(`watcher.py:325`)는 `write_status(FAILED, ...)` 만 부르고 지�
 지금은 아무도 안 읽어서 무해하다. 하지만 **2단계부터 `session.json` 을 소비하기 시작하면
 중단된 세션을 "변경 없음"으로 오독한다.**
 
-권고: abort 시 `watched_files` 를 **빼거나 `"unknown"` 으로 표시한다** — 계산하지 않았다는
-사실을 그대로 남기는 쪽이다. baseline↔현재 해시를 다시 비교해 채우는 방법도 있지만, abort 는
-"빨리 끝내라"는 요청이라 파일 스캔을 한 번 더 도는 것은 그 의도와 충돌한다.
+> **2026-08-28 해결.** abort 시 `watched_files` 를 전부 `"unknown"` 으로 낮춘다
+> (`watcher.unknown_file_statuses`). 필드를 통째로 빼지 않은 것은 **감시 대상 목록 자체는
+> 실제 정보**이기 때문이다 — 주장할 수 없는 것은 상태뿐이다. baseline↔현재 해시를 다시
+> 비교해 채우는 방법도 있었지만, abort 는 "빨리 끝내라"는 요청이라 파일 스캔을 한 번 더
+> 도는 것은 그 의도와 충돌한다.
+>
+> 회귀 테스트 2개: `test_unknown_file_statuses_is_pure`(순수 함수),
+> `test_aborted_session_does_not_claim_files_unchanged`(두 번째 Ctrl+C 를
+> `wait_for_stability` 에 주입해 실제 abort 경로를 태운다).
+> **고치기 전 코드에서 `unchanged != unknown` 으로 실패하는 것을 확인했다.**
 
 ## 6. 이미 내려진 결정 — 다시 논쟁하지 말 것
 
@@ -334,6 +346,7 @@ abort 분기(`watcher.py:325`)는 `write_status(FAILED, ...)` 만 부르고 지�
 | — | 종료 코드 4종 | `EXIT_OK=0`, `EXIT_RUNTIME=1`, `EXIT_CONFIG=2`, `EXIT_ABORTED=130` (PRD 10.3, C-10 으로 7종→4종) |
 | — | symlink 디렉터리는 **전부** 미하강 | PRD 13.3 은 "루트 밖으로 나가는 symlink" 한정이지만 구현이 더 엄격한 쪽이라 수용 기준 위반이 아니다 |
 | — | 게이트 명령(`pytest`·`ruff`·`mypy`)은 에이전트가 **승인 없이 실행**한다 | 안 열면 에이전트가 자기 산출물을 검증할 수 없다. 세 모듈로만 못박았고 판정권은 여전히 셸에 있다 (`1e7fe58`) |
+| — | (다)(라) 두 결함도 **파이프라인 밖에서** 고쳤다 | 파이프라인 한 바퀴가 ~$8 인데 고칠 것이 각 1~3줄이었다. 게이트가 못 잡는 결함이라 재시도로도 안 잡히고, diff-engine 설계 범위 밖이라 다음 impl 도 안 건드린다 — (다)를 0단계 impl 이 실제로 그냥 두고 갔다. **회귀 테스트 3개를 같이 넣었고, 고치기 전 코드에서 실패하는 것을 확인했다** |
 | — | 0단계의 ruff E501 은 **파이프라인 밖에서** 고쳤다 | 재시도에 ~$13 이 드는데 고칠 대상이 주석 한 줄이었다. 근본 원인(권한)은 같은 주행에서 고쳤다. **1단계부터는 파이프라인 안에서 닫는다** |
 
 ## 7. 하네스 결함 5건 — 전부 이 저장소에서만 고쳐졌다
@@ -407,7 +420,7 @@ impl 이 주석 한 줄을 두 주행 내내 못 고친 것이 그 증거다.
 - **중단된 세션의 `session.json` 은 `watched_files` 를 믿으면 안 된다** — 5절 (라).
 - 판정 함수(`run_preflight` 등)에는 `print` 가 없다. 콘솔 출력은 `main` 에서만 한다.
 - verify 는 `tests/test_*.py` 만 수정할 수 있다 (`prompts/verify.md:62`). **소스의 린트·타입 오류는 impl 만 고칠 수 있다.**
-- 0단계 JUDGE 미확인 2건(Windows `os.replace` 원자성, `token_hex(2)`)은 119개 테스트가
+- 0단계 JUDGE 미확인 2건(Windows `os.replace` 원자성, `token_hex(2)`)은 122개 테스트가
   실제로 돌면서 간접 확인됐다. 1단계 미확인 3건 중 **#25(Ctrl+C 반응 시간)는 2026-08-28
   실기기로 해소**됐고, **#23·#24(폴링 전환)는 아직 열려 있다** — 5절 (가) 4번이 푸는 절차다.
 - 콘솔 한글이 cp949 로 깨지는 정도가 아니라 **죽는 경로가 하나 있다** — 5절 (다).
@@ -430,7 +443,7 @@ git clone https://github.com/pro047/class-code-watcher.git
 cd class-code-watcher
 py -3.14 -m venv .venv                    # 3.11 이상이면 됨
 .venv\Scripts\python -m pip install -e ".[dev]"
-.venv\Scripts\python -m pytest -q       # 119 passed 나와야 정상
+.venv\Scripts\python -m pytest -q       # 122 passed 나와야 정상
 ```
 
 `.env` 도 커밋되지 않는다. 1~3단계는 외부 호출이 없어 없어도 되고, 4단계(LLM)부터

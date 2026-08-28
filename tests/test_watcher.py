@@ -10,7 +10,7 @@ import json
 import queue
 from collections.abc import Callable, Iterator
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 from watchdog.events import (
@@ -516,3 +516,44 @@ def test_emitted_lines_are_masked_by_cli(
     assert secret_value not in captured.out
     assert secret_value not in captured.err
     assert "[MASKED]" in captured.out
+
+
+# ── 중단된 세션은 파일 상태를 주장하지 않는다 (HANDOFF 5절 라) ────────────────
+
+
+def test_unknown_file_statuses_is_pure() -> None:
+    selected = (PurePosixPath("a.py"), PurePosixPath("pkg/b.py"))
+    assert watcher.unknown_file_statuses(selected) == [
+        {"path": "a.py", "status": "unknown"},
+        {"path": "pkg/b.py", "status": "unknown"},
+    ]
+
+
+def test_aborted_session_does_not_claim_files_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 두 번째 Ctrl+C 는 안정화 대기 중에 들어온다. 그러면 baseline↔final 비교를 못 하는데,
+    # 시작 시점 doc 의 unchanged 가 그대로 남으면 "변경 없음"이라고 거짓말하게 된다.
+    config, paths, selection = _setup_session(tmp_path)
+    root = config.watch_root
+
+    def change(debouncer: Debouncer) -> None:
+        (root / "a.py").write_bytes(b"x = 2\n")
+        debouncer.observe(RawEvent(rel_path="a.py", kind="modified", at=0.0))
+
+    def second_ctrl_c(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    _script_loop(monkeypatch, [change])
+    monkeypatch.setattr(watcher, "wait_for_stability", second_ctrl_c)
+    outcome = run_session(config, paths, selection, lambda line: None)
+
+    assert outcome.aborted is True
+    doc = _session_doc(paths)
+    assert doc["status"] == "failed"
+    assert doc["error"] == watcher.ABORTED_ERROR
+    assert doc["watched_files"] == [{"path": "a.py", "status": "unknown"}]
+    # 판정을 못 했으므로 no_change 는 아예 쓰지 않는다.
+    assert "no_change" not in doc
+    # 산출물은 남는다 — baseline 은 시작 시점 바이트, final 스냅샷은 뜨지 못했다.
+    assert (paths.baseline_dir / "a.py").read_bytes() == b"x = 1\n"

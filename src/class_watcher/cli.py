@@ -128,7 +128,7 @@ def run_preflight(config: WatchConfig) -> Preflight:
     if len(selection.selected) > config.max_files:
         raise PreflightError(
             f"감시 대상이 {len(selection.selected)}개로 상한 {config.max_files}개를 넘습니다. "
-            "상위 디렉터리를 지정했을 수 있습니다 — DIR 을 더 좁게 주거나 "
+            "상위 디렉터리를 지정했을 수 있습니다. DIR 을 더 좁게 주거나 "
             "--include 로 범위를 줄이거나 --max-files 를 올리세요.",
             EXIT_CONFIG,
         )

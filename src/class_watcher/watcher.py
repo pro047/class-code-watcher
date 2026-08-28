@@ -10,7 +10,7 @@ import json
 import os
 import queue
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -41,6 +41,8 @@ STATUS_UNCHANGED = "unchanged"
 STATUS_MODIFIED = "modified"
 STATUS_ADDED = "added"
 STATUS_DELETED = "deleted"
+# 중단된 세션 전용. baseline↔final 비교를 못 했으므로 어느 상태도 주장하지 않는다.
+STATUS_UNKNOWN = "unknown"
 
 # 변경이 있는 세션의 종료 사유 — 요약·전송 단계가 아직 없다.
 PENDING_PIPELINE_ERROR = "summary_pipeline_not_implemented"
@@ -73,6 +75,15 @@ def compute_statuses(
         else:
             statuses[rel_path] = STATUS_MODIFIED
     return statuses
+
+
+def unknown_file_statuses(selected: Sequence[PurePosixPath]) -> list[dict[str, str]]:
+    """순수 — 중단된 세션의 watched_files.
+
+    시작 시점 doc 은 전 파일을 unchanged 로 적어 둔다. 중단되면 그 값이 그대로 굳어
+    "변경 없음"이라고 잘못 말하게 되므로 판정 불가로 낮춘다.
+    """
+    return [{"path": str(path), "status": STATUS_UNKNOWN} for path in selected]
 
 
 def is_no_change(statuses: Mapping[str, str]) -> bool:
@@ -325,7 +336,12 @@ def _finalize(
 
     ended_at = datetime.now().astimezone().isoformat()
     if aborted:
-        state.write_status(SessionStatus.FAILED, ended_at=ended_at, error=ABORTED_ERROR)
+        state.write_status(
+            SessionStatus.FAILED,
+            ended_at=ended_at,
+            error=ABORTED_ERROR,
+            watched_files=unknown_file_statuses(state.selection.selected),
+        )
         state.emit("[ABORTED] 두 번째 종료 요청. 지금까지의 산출물만 남깁니다.")
         return WatchOutcome(
             statuses=statuses,

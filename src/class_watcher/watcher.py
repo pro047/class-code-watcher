@@ -24,6 +24,7 @@ from .config import (
     DEFAULT_STABLE_MS,
     DEFAULT_STABLE_TIMEOUT_MS,
     FINALIZE_ENTER_BUDGET_MS,
+    Secrets,
     WatchConfig,
 )
 from .debounce import Debouncer, EventKind, LogicalEvent, RawEvent
@@ -31,9 +32,21 @@ from .diffgen import (
     DiffResult,
     change_stats_fields,
     generate_session_diff,
+    render_final_diff,
     watched_file_entries,
 )
 from .eventlog import append_jsonl, event_row
+from .redact import (
+    ERROR_SECRETS_DETECTED,
+    RedactionResult,
+    build_env_markers,
+    by_rule_counts,
+    default_rules,
+    redact_diff,
+    redaction_doc,
+    session_redaction_fields,
+    write_redaction_json,
+)
 from .selector import Selection, is_watched
 from .session import SessionPaths, SessionStatus, transition, write_session_json
 from .snapshot import SnapshotResult, hash_bytes, hash_map, snapshot_tree, write_manifest
@@ -62,6 +75,8 @@ class WatchOutcome:
     logical_event_count: int
     no_change: bool
     aborted: bool
+    # 비밀값 탐지로 외부 전송을 중단한 세션 (FR-036). 종료 코드는 1 그대로다.
+    secrets_blocked: bool = False
 
 
 def compute_statuses(
@@ -185,11 +200,14 @@ class _Session:
         paths: SessionPaths,
         selection: Selection,
         emit: Callable[[str], None],
+        secrets: Secrets,
     ) -> None:
         self.config = config
         self.paths = paths
         self.selection = selection
         self.emit = emit
+        # known-value 탐지 규칙에만 쓴다 (FR-036). 다른 용도로 쓰지 않는다.
+        self.secrets = secrets
         self.doc: dict[str, object] = {}
         self.baseline_hashes: dict[str, str] = {}
         self.observed: set[str] = set()
@@ -276,6 +294,58 @@ def _generate_diff(
     return result
 
 
+def _scan_console_line(result: RedactionResult) -> str:
+    """PRD 10.1 의 [SCAN] 한 줄. 규칙 ID 와 건수만 싣는다 — 위치는 redaction.json 이 안내한다."""
+    found = len(result.findings)
+    if found == 0:
+        return "[SCAN] 비밀정보 패턴 탐지 없음"
+    if result.blocked:
+        counts = by_rule_counts(result.findings)
+        rules = ", ".join(f"{rule} {count}" for rule, count in counts.items())
+        return f"[SCAN] 비밀정보 패턴 {found}건 탐지 (규칙: {rules}) - 외부 전송을 중단합니다"
+    return f"[SCAN] 비밀정보 패턴 {found}건 탐지 - --allow-secrets 로 마스킹 후 진행합니다"
+
+
+def _run_redaction(state: "_Session", diff_result: DiffResult) -> RedactionResult | None:
+    """외부 전송 직전의 정제 (FR-036~FR-038). 판정은 전부 redact.py 순수 함수가 한다.
+
+    산출물 쓰기가 실패하면 None 을 돌려준다. 스캔 실패를 "통과"로 오인해 전송으로 흘리면
+    안 되므로 안전한 쪽으로 실패시킨다 — 세션 자체는 죽이지 않는다 (PRD 12절 복구 원칙).
+    """
+    known = [
+        value
+        for value in (state.secrets.openai_api_key, state.secrets.discord_webhook_url)
+        if value
+    ]
+    result = redact_diff(
+        render_final_diff(diff_result),
+        scanned_paths=[item.rel_path for item in diff_result.files],
+        allow_secrets=state.config.allow_secrets,
+        markers=build_env_markers(state.config.watch_root, os.environ),
+        rules=default_rules(known),
+    )
+    doc = redaction_doc(
+        result,
+        scanned_at=datetime.now().astimezone().isoformat(),
+        allow_secrets=state.config.allow_secrets,
+    )
+    try:
+        write_redaction_json(state.paths.redaction_json, doc)
+    except OSError as exc:
+        append_jsonl(
+            state.paths.errors_jsonl,
+            {
+                "timestamp": datetime.now().astimezone().isoformat(),
+                "stage": "redaction",
+                "error": type(exc).__name__,
+            },
+        )
+        state.emit("[WARN] 비밀정보 검사 결과를 저장하지 못했습니다. 외부 전송은 하지 않습니다.")
+        return None
+    state.emit(_scan_console_line(result))
+    return result
+
+
 def _drain_queue(sink: "queue.Queue[RawEvent]", debouncer: Debouncer) -> None:
     """큐를 짧게 기다렸다가 쌓인 것을 한 번에 흡수한다."""
     deadline = debouncer.next_deadline()
@@ -296,9 +366,10 @@ def run_session(
     paths: SessionPaths,
     selection: Selection,
     emit: Callable[[str], None],
+    secrets: Secrets,
 ) -> WatchOutcome:
     """감시 세션 전체. session.json 의 상태 전이도 여기서 밟는다 (FR-040)."""
-    state = _Session(config, paths, selection, emit)
+    state = _Session(config, paths, selection, emit, secrets)
     state.doc = json.loads(paths.session_json.read_text(encoding="utf-8"))
 
     decision = resolve_watch_mode(config.watch_root, config.polling, os.environ, _drive_type_of)
@@ -349,6 +420,7 @@ def _finalize(
     unstable = False
     statuses: dict[str, str] = {}
     diff_result: DiffResult | None = None
+    redaction: RedactionResult | None = None
     # stats.json 과 session.json 이 서로 다른 시각을 말하면 같은 세션으로 안 보인다.
     ended_at: str | None = None
     try:
@@ -383,6 +455,9 @@ def _finalize(
         # no_change 세션은 diff 산출물을 만들지 않는다 (FR-035 경로 불변).
         if not is_no_change(statuses):
             diff_result = _generate_diff(state, statuses, ended_at)
+            # diff 를 못 만든 세션은 스캔할 대상 자체가 없다.
+            if diff_result is not None:
+                redaction = _run_redaction(state, diff_result)
     except KeyboardInterrupt:
         aborted = True
 
@@ -424,8 +499,14 @@ def _finalize(
         "change_stats": change_stats,
         "no_change": no_change,
     }
+    if redaction is not None:
+        fields["redaction"] = session_redaction_fields(redaction)
+    secrets_blocked = redaction is not None and redaction.blocked
     if no_change:
         state.write_status(SessionStatus.COMPLETED, **fields)
+    elif secrets_blocked:
+        # 탐지-중단은 PRD 12절 표의 failed 다. 종료 코드 1 의 세부 원인은 error 가 구분한다.
+        state.write_status(SessionStatus.FAILED, **fields, error=ERROR_SECRETS_DETECTED)
     else:
         # 요약~전송(2~5단계)이 아직 없어 세션을 완료로 부를 수 없다 (PRD 10.3 코드 1).
         state.write_status(SessionStatus.PARTIAL, **fields, error=PENDING_PIPELINE_ERROR)
@@ -436,6 +517,7 @@ def _finalize(
         logical_event_count=state.event_count,
         no_change=no_change,
         aborted=False,
+        secrets_blocked=secrets_blocked,
     )
 
 

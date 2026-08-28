@@ -34,6 +34,8 @@ from class_watcher.watcher import WatchOutcome, compute_statuses, is_no_change, 
 
 NOW = datetime(2026, 8, 27, 10, 0, 0).astimezone()
 INCLUDE = ("*.py",)
+# run_session 의 5번째 인자 (known-value 탐지 규칙용). 키가 없는 상태가 기본이다.
+NO_SECRETS = Secrets(openai_api_key=None, discord_webhook_url=None)
 
 # ── 기준 24: 핸들러가 exclude 경로·allowlist 밖 확장자를 버린다 (FR-011) ──────
 
@@ -174,7 +176,7 @@ def _script_loop(monkeypatch: pytest.MonkeyPatch, steps: list[Step]) -> _DummyOb
 
 
 def _setup_session(
-    tmp_path: Path, *, history: bool = False
+    tmp_path: Path, *, history: bool = False, allow_secrets: bool = False
 ) -> tuple[WatchConfig, SessionPaths, Selection]:
     root = tmp_path / "tree"
     root.mkdir()
@@ -191,7 +193,7 @@ def _setup_session(
         session_dir=tmp_path / "sessions",
         dry_run=False,
         no_discord=False,
-        allow_secrets=False,
+        allow_secrets=allow_secrets,
     )
     selection = scan_files(root, config.include, config.exclude)
     session_id = "20260827-100000-ab12"
@@ -216,7 +218,7 @@ def test_no_change_session_completes(
     _script_loop(monkeypatch, [])
     lines: list[str] = []
 
-    outcome = run_session(config, paths, selection, lines.append)
+    outcome = run_session(config, paths, selection, lines.append, NO_SECRETS)
 
     assert outcome.no_change is True
     assert outcome.aborted is False
@@ -329,7 +331,7 @@ def test_new_file_during_session_recorded_as_added(
         debouncer.observe(RawEvent(rel_path="new.py", kind="created", at=0.0))
 
     _script_loop(monkeypatch, [create])
-    outcome = run_session(config, paths, selection, lambda line: None)
+    outcome = run_session(config, paths, selection, lambda line: None, NO_SECRETS)
 
     assert outcome.statuses == {"a.py": "unchanged", "new.py": "added"}
     assert outcome.no_change is False
@@ -348,7 +350,7 @@ def test_deleted_file_recorded_with_null_digest(
         debouncer.observe(RawEvent(rel_path="a.py", kind="deleted", at=0.0))
 
     _script_loop(monkeypatch, [delete])
-    outcome = run_session(config, paths, selection, lambda line: None)
+    outcome = run_session(config, paths, selection, lambda line: None, NO_SECRETS)
 
     assert outcome.statuses == {"a.py": "deleted"}
     [row] = [
@@ -376,7 +378,7 @@ def test_binary_only_change_is_skipped_but_not_no_change(
 
     _script_loop(monkeypatch, [change])
     lines: list[str] = []
-    run_session(config, paths, selection, lines.append)
+    run_session(config, paths, selection, lines.append, NO_SECRETS)
 
     doc = _session_doc(paths)
     assert doc["no_change"] is False  # no_change 판정은 해시 기준 그대로다
@@ -409,7 +411,7 @@ def test_diff_failure_logs_error_and_keeps_session(
     _script_loop(monkeypatch, [change])
     monkeypatch.setattr(watcher, "generate_session_diff", boom)
     lines: list[str] = []
-    outcome = run_session(config, paths, selection, lines.append)
+    outcome = run_session(config, paths, selection, lines.append, NO_SECRETS)
 
     assert outcome.aborted is False
     doc = _session_doc(paths)
@@ -456,7 +458,7 @@ def test_status_transitions_in_order_for_no_change(
     _script_loop(monkeypatch, [])
     recorded = _record_transitions(monkeypatch)
 
-    run_session(config, paths, selection, lambda line: None)
+    run_session(config, paths, selection, lambda line: None, NO_SECRETS)
 
     # 첫 기록(watch_mode 반영)은 아직 starting 이다. 전이 순서만 고정한다.
     assert [status for status in recorded if status != "starting"] == [
@@ -479,7 +481,7 @@ def test_status_transitions_end_partial_when_changed(
     _script_loop(monkeypatch, [change])
     recorded = _record_transitions(monkeypatch)
 
-    run_session(config, paths, selection, lambda line: None)
+    run_session(config, paths, selection, lambda line: None, NO_SECRETS)
 
     assert [status for status in recorded if status != "starting"] == [
         "watching",
@@ -506,7 +508,7 @@ def test_history_writes_sequential_snapshots(
         debouncer.observe(RawEvent(rel_path="a.py", kind="modified", at=0.0))
 
     _script_loop(monkeypatch, [first, second])
-    run_session(config, paths, selection, lambda line: None)
+    run_session(config, paths, selection, lambda line: None, NO_SECRETS)
 
     assert (paths.history_dir / "0001" / "a.py").read_bytes() == b"x = 2\n"
     assert (paths.history_dir / "0002" / "a.py").read_bytes() == b"x = 3\n"
@@ -539,6 +541,7 @@ def test_aborted_outcome_maps_to_130(
         paths_: SessionPaths,
         selection_: Selection,
         emit: Callable[[str], None],
+        secrets_: Secrets,
     ) -> WatchOutcome:
         return WatchOutcome(
             statuses={}, unstable=False, logical_event_count=0, no_change=False, aborted=True
@@ -564,6 +567,7 @@ def test_oserror_during_watch_records_failed(
         paths_: SessionPaths,
         selection_: Selection,
         emit: Callable[[str], None],
+        secrets_: Secrets,
     ) -> WatchOutcome:
         raise OSError("디스크가 사라졌다")
 
@@ -594,6 +598,7 @@ def test_emitted_lines_are_masked_by_cli(
         paths_: SessionPaths,
         selection_: Selection,
         emit: Callable[[str], None],
+        secrets_: Secrets,
     ) -> WatchOutcome:
         emit(f"디버그 출력에 섞인 키: {secret_value}")
         return WatchOutcome(
@@ -641,7 +646,7 @@ def test_aborted_session_does_not_claim_files_unchanged(
 
     _script_loop(monkeypatch, [change])
     monkeypatch.setattr(watcher, "wait_for_stability", second_ctrl_c)
-    outcome = run_session(config, paths, selection, lambda line: None)
+    outcome = run_session(config, paths, selection, lambda line: None, NO_SECRETS)
 
     assert outcome.aborted is True
     doc = _session_doc(paths)
@@ -652,3 +657,220 @@ def test_aborted_session_does_not_claim_files_unchanged(
     assert "no_change" not in doc
     # 산출물은 남는다 — baseline 은 시작 시점 바이트, final 스냅샷은 뜨지 못했다.
     assert (paths.baseline_dir / "a.py").read_bytes() == b"x = 1\n"
+
+
+# ── 3단계 정제 배선 — 탐지·차단·마스킹·산출물 (FR-036~FR-038, 설계 기준 17~22) ──
+
+SECRET_VALUE = "sk-fixture0123456789abcdefgh"
+SECRET_LINE = f"# {SECRET_VALUE}\n".encode()
+
+
+def _plant_secret(root: Path) -> Step:
+    def change(debouncer: Debouncer) -> None:
+        (root / "a.py").write_bytes(SECRET_LINE)
+        debouncer.observe(RawEvent(rel_path="a.py", kind="modified", at=0.0))
+
+    return change
+
+
+def test_secret_session_blocks_and_preserves_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 기준 17: 탐지-중단 세션은 failed+secrets_detected 로 끝나고 로컬 산출물은 전부 남는다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_plant_secret(config.watch_root)])
+    lines: list[str] = []
+
+    outcome = run_session(config, paths, selection, lines.append, NO_SECRETS)
+
+    assert outcome.secrets_blocked is True
+    assert outcome.aborted is False
+    assert outcome.no_change is False
+    doc = _session_doc(paths)
+    assert doc["status"] == "failed"
+    assert doc["error"] == "secrets_detected"
+    assert doc["redaction"] == {
+        "secrets_found": 1,
+        "by_rule": {"openai_api_key": 1},
+        # 차단 세션은 정제 본문을 만들지 않는다 (IMPL 2절 4항).
+        "paths_relativized": False,
+    }
+    raw = paths.redaction_json.read_text(encoding="utf-8")
+    redaction = json.loads(raw)
+    assert redaction["policy"] == "block"
+    assert redaction["allow_secrets"] is False
+    assert redaction["secrets_found"] == 1
+    [finding] = redaction["findings"]
+    assert finding["rule"] == "openai_api_key"
+    assert finding["path"] == "a.py"
+    assert finding["line"] > 0
+    # FR-042: 산출물·콘솔 어디에도 탐지 원문(마지막 4자 포함)이 없다.
+    assert SECRET_VALUE not in raw
+    assert SECRET_VALUE[-4:] not in raw
+    assert SECRET_VALUE not in "\n".join(lines)
+    # 차단되는 것은 외부 전송뿐이다 — diff·stats·스냅샷은 그대로 보존된다 (PRD 12절).
+    assert paths.final_diff.exists()
+    assert paths.stats_json.exists()
+    assert (paths.baseline_dir / "a.py").read_bytes() == b"x = 1\n"
+    assert (paths.final_dir / "a.py").read_bytes() == SECRET_LINE
+    assert any(
+        line.startswith("[SCAN]") and "외부 전송을 중단합니다" in line for line in lines
+    )
+
+
+def test_allow_secrets_session_masks_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 기준 18: 같은 세션 + --allow-secrets 는 기존 과도기 경로(partial)로 진행한다 (FR-038).
+    config, paths, selection = _setup_session(tmp_path, allow_secrets=True)
+    _script_loop(monkeypatch, [_plant_secret(config.watch_root)])
+    lines: list[str] = []
+
+    outcome = run_session(config, paths, selection, lines.append, NO_SECRETS)
+
+    assert outcome.secrets_blocked is False
+    doc = _session_doc(paths)
+    assert doc["status"] == "partial"
+    assert doc["error"] == watcher.PENDING_PIPELINE_ERROR
+    assert doc["redaction"] == {
+        "secrets_found": 1,
+        "by_rule": {"openai_api_key": 1},
+        "paths_relativized": True,
+    }
+    raw = paths.redaction_json.read_text(encoding="utf-8")
+    redaction = json.loads(raw)
+    assert redaction["policy"] == "mask"
+    assert redaction["allow_secrets"] is True
+    assert SECRET_VALUE not in raw
+    assert any("마스킹 후 진행합니다" in line for line in lines)
+
+
+def test_clean_changed_session_writes_clean_redaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 기준 19: 비밀값 없는 변경 세션은 기존 상태 전이 그대로 + redaction 산출물이 추가된다.
+    config, paths, selection = _setup_session(tmp_path)
+    root = config.watch_root
+
+    def change(debouncer: Debouncer) -> None:
+        (root / "a.py").write_bytes(b"x = 2\n")
+        debouncer.observe(RawEvent(rel_path="a.py", kind="modified", at=0.0))
+
+    _script_loop(monkeypatch, [change])
+    lines: list[str] = []
+    outcome = run_session(config, paths, selection, lines.append, NO_SECRETS)
+
+    assert outcome.secrets_blocked is False
+    doc = _session_doc(paths)
+    assert doc["status"] == "partial"
+    assert doc["error"] == watcher.PENDING_PIPELINE_ERROR
+    assert doc["redaction"] == {
+        "secrets_found": 0,
+        "by_rule": {},
+        "paths_relativized": True,
+    }
+    redaction = json.loads(paths.redaction_json.read_text(encoding="utf-8"))
+    assert redaction["policy"] == "clean"
+    assert redaction["secrets_found"] == 0
+    assert redaction["findings"] == []
+    assert "[SCAN] 비밀정보 패턴 탐지 없음" in lines
+
+
+def test_no_change_session_skips_redaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 기준 20 · FR-035 경로 불변: 변경 없음이면 스캔이 돌지 않고 redaction.json 도 없다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [])
+    lines: list[str] = []
+
+    run_session(config, paths, selection, lines.append, NO_SECRETS)
+
+    assert not paths.redaction_json.exists()
+    assert "redaction" not in _session_doc(paths)
+    assert not any(line.startswith("[SCAN]") for line in lines)
+
+
+def test_second_ctrl_c_during_redaction_aborts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 기준 21: 정제 도중 두 번째 Ctrl+C 도 abort 경로(FAILED+aborted_by_user)로 빠진다.
+    config, paths, selection = _setup_session(tmp_path)
+    root = config.watch_root
+
+    def change(debouncer: Debouncer) -> None:
+        (root / "a.py").write_bytes(b"x = 2\n")
+        debouncer.observe(RawEvent(rel_path="a.py", kind="modified", at=0.0))
+
+    def second_ctrl_c(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    _script_loop(monkeypatch, [change])
+    monkeypatch.setattr(watcher, "redact_diff", second_ctrl_c)
+    outcome = run_session(config, paths, selection, lambda line: None, NO_SECRETS)
+
+    assert outcome.aborted is True
+    assert outcome.secrets_blocked is False
+    doc = _session_doc(paths)
+    assert doc["status"] == "failed"
+    assert doc["error"] == watcher.ABORTED_ERROR
+
+
+def test_redaction_write_failure_fails_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 설계 5.5 마지막 행: redaction.json 쓰기 실패는 errors.jsonl 에 남고 세션은 계속되되,
+    # 스캔 통과로 오인되지 않는다 (redaction 필드 없음 = 4단계에 넘길 text 없음).
+    config, paths, selection = _setup_session(tmp_path)
+    root = config.watch_root
+
+    def change(debouncer: Debouncer) -> None:
+        (root / "a.py").write_bytes(b"x = 2\n")
+        debouncer.observe(RawEvent(rel_path="a.py", kind="modified", at=0.0))
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise OSError("디스크 꽉 참")
+
+    _script_loop(monkeypatch, [change])
+    monkeypatch.setattr(watcher, "write_redaction_json", boom)
+    lines: list[str] = []
+    outcome = run_session(config, paths, selection, lines.append, NO_SECRETS)
+
+    assert outcome.aborted is False
+    assert outcome.secrets_blocked is False
+    doc = _session_doc(paths)
+    assert doc["status"] == "partial"
+    assert doc["error"] == watcher.PENDING_PIPELINE_ERROR
+    assert "redaction" not in doc
+    assert not paths.redaction_json.exists()
+    [row] = [
+        json.loads(line)
+        for line in paths.errors_jsonl.read_text(encoding="utf-8").splitlines()
+    ]
+    assert row["stage"] == "redaction"
+    assert row["error"] == "OSError"
+    [warn] = [line for line in lines if line.startswith("[WARN]")]
+    assert "외부 전송은 하지 않습니다" in warn
+    warn.encode("cp949")  # 리다이렉트(cp949) 콘솔에서도 안 깨진다 (HANDOFF (다))
+
+
+def test_secrets_blocked_maps_to_exit_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 기준 22: cli 는 탐지-중단 세션에 전용 [FAILED] 안내를 내고 코드 1 로 끝난다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_plant_secret(config.watch_root)])
+    rc = cli.run_watch(
+        cli.Preflight(config=config, selection=selection), paths, NO_SECRETS
+    )
+    assert rc == cli.EXIT_RUNTIME
+    captured = capsys.readouterr()
+    assert "[FAILED] 비밀정보 패턴이 탐지되어 외부 전송을 중단했습니다." in captured.err
+    assert "redaction.json" in captured.err
+    assert "세션 산출물은 보존됩니다" in captured.err
+    # 차단 분기는 기존 과도기 [FAILED] 문구를 내지 않는다.
+    assert "요약·전송 단계는 아직 구현되지 않았습니다" not in captured.err
+    assert "외부 전송을 중단합니다" in captured.out  # [SCAN] 라인
+    # 회귀: 새 콘솔 문자열 전부 cp949 로 인코딩된다 (HANDOFF (다) 결함 재발 방지).
+    captured.out.encode("cp949")
+    captured.err.encode("cp949")

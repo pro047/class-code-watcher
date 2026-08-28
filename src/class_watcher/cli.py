@@ -168,6 +168,7 @@ def run_watch(preflight: Preflight, paths: SessionPaths, secrets: Secrets) -> in
             paths,
             preflight.selection,
             lambda message: _emit(message, secrets),
+            secrets,
         )
     except OSError as exc:
         _record_failure(paths, "watch_io_error")
@@ -188,6 +189,12 @@ def run_watch(preflight: Preflight, paths: SessionPaths, secrets: Secrets) -> in
 
     changed = sum(1 for status in outcome.statuses.values() if status != "unchanged")
     _emit(f"[OK] 변경 {changed}개 파일 / 이벤트 {outcome.logical_event_count}건", secrets)
+    if outcome.secrets_blocked:
+        # FR-036: 로컬 산출물은 모두 보존하고 외부 전송만 막는다.
+        _emit_error("[FAILED] 비밀정보 패턴이 탐지되어 외부 전송을 중단했습니다.", secrets)
+        _emit_error("       탐지 위치는 redaction.json 을 확인하세요.", secrets)
+        _emit_error(f"       세션 산출물은 보존됩니다: {paths.root}", secrets)
+        return EXIT_RUNTIME
     _emit_error("[FAILED] 요약·전송 단계는 아직 구현되지 않았습니다.", secrets)
     _emit_error(f"       세션 산출물은 보존됩니다: {paths.root}", secrets)
     return EXIT_RUNTIME

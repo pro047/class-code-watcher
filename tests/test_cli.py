@@ -279,6 +279,69 @@ def test_main_changed_session_ends_partial(
     assert "[FAILED] 요약·전송 단계는 아직 구현되지 않았습니다." in captured.err
 
 
+def test_main_secret_session_blocks_without_network(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # FR-036 + 불변식(FR-030/FR-035 기반): 탐지-차단 세션도 네트워크를 전혀 만지지 않고,
+    # 로컬 산출물(redaction.json 포함)만 남긴 채 코드 1 로 끝난다.
+    def _forbid(*args: object, **kwargs: object) -> object:
+        raise AssertionError("차단 세션은 네트워크를 만지면 안 된다 (FR-036)")
+
+    monkeypatch.setattr(socket, "socket", _forbid)
+    monkeypatch.setattr(socket, "create_connection", _forbid)
+    tree = _make_tree(isolated_env, count=1)
+    sessions = isolated_env / "sessions"
+    planted = "sk-fixture0123456789abcdefgh"
+
+    def change(debouncer: Debouncer) -> None:
+        (tree / "file0.py").write_text(f"# {planted}\n", encoding="utf-8")
+        debouncer.observe(RawEvent(rel_path="file0.py", kind="modified", at=0.0))
+
+    _interrupt_after(monkeypatch, [change])
+    rc = cli.main(["watch", str(tree), "--session-dir", str(sessions)])
+    assert rc == cli.EXIT_RUNTIME
+
+    [root] = list(sessions.iterdir())
+    doc = json.loads((root / "session.json").read_text(encoding="utf-8"))
+    assert doc["status"] == "failed"
+    assert doc["error"] == "secrets_detected"
+    assert (root / "redaction.json").is_file()
+
+    captured = capsys.readouterr()
+    assert "[FAILED] 비밀정보 패턴이 탐지되어 외부 전송을 중단했습니다." in captured.err
+    assert "redaction.json" in captured.err
+    # FR-042: 콘솔 어디에도 탐지 원문이 없다.
+    assert planted not in captured.out + captured.err
+
+
+def test_main_allow_secrets_masks_and_continues(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # FR-038: --allow-secrets 는 마스킹 후 기존 과도기 경로(partial / 코드 1)로 진행한다.
+    tree = _make_tree(isolated_env, count=1)
+    sessions = isolated_env / "sessions"
+
+    def change(debouncer: Debouncer) -> None:
+        (tree / "file0.py").write_text("# sk-fixture0123456789abcdefgh\n", encoding="utf-8")
+        debouncer.observe(RawEvent(rel_path="file0.py", kind="modified", at=0.0))
+
+    _interrupt_after(monkeypatch, [change])
+    rc = cli.main(["watch", str(tree), "--allow-secrets", "--session-dir", str(sessions)])
+    assert rc == cli.EXIT_RUNTIME
+
+    [root] = list(sessions.iterdir())
+    doc = json.loads((root / "session.json").read_text(encoding="utf-8"))
+    assert doc["status"] == "partial"
+    assert doc["error"] == "summary_pipeline_not_implemented"
+    redaction = json.loads((root / "redaction.json").read_text(encoding="utf-8"))
+    assert redaction["policy"] == "mask"
+    assert redaction["allow_secrets"] is True
+
+    captured = capsys.readouterr()
+    assert "마스킹 후 진행합니다" in captured.out
+    assert "비밀정보 패턴이 탐지되어 외부 전송을 중단했습니다" not in captured.err
+
+
 def test_main_warns_on_empty_selection_but_continues(
     isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

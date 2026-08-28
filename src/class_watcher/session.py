@@ -51,6 +51,8 @@ class SessionPaths:
     # 변경이 있는 세션에서만 생긴다 — no_change 는 diff 단계에 들어가지 않는다 (FR-035).
     final_diff: Path
     stats_json: Path
+    # diff 가 만들어진 세션에서만 생긴다 — 정제 단계는 diff 직후에만 돈다 (FR-036).
+    redaction_json: Path
     # `--history` 일 때만 실제로 만들어진다 (PRD 9.1).
     history_dir: Path
 
@@ -66,6 +68,7 @@ def make_session_paths(session_dir: Path, session_id: str) -> SessionPaths:
         errors_jsonl=root / "errors.jsonl",
         final_diff=root / "final.diff",
         stats_json=root / "stats.json",
+        redaction_json=root / "redaction.json",
         history_dir=root / "history",
     )
 

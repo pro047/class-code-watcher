@@ -774,49 +774,16 @@ build_verify_list
 state "PREFLIGHT" "검증 명령: $VERIFY_LIST_DESC"
 log "검증 목록: $VERIFY_LIST_DESC"
 
-if [ "$FRESH_DESIGN" != "1" ] && [ -f "$WORK/DESIGN.md" ] \
-   && [ "$(grep -m1 '^STATUS:' "$WORK/DESIGN.md" | awk '{print $2}')" = "DONE" ]; then
-  log "↺ 기존 DESIGN.md 재사용 ($(date -r "$WORK/DESIGN.md" '+%m-%d %H:%M') 생성) — 새로 뽑으려면 FRESH_DESIGN=1"
-  state "REUSED:design" "기존 산출물 재사용"
-else
-  run_stage design "$MODEL_DESIGN" "$FALLBACK_DESIGN" "$PROMPTS/design.md" "$WORK/DESIGN.md"
-fi
-
-# ─────────────────────────────────────────── 판단 검증
-# 설계의 '주장'을 별 프로세스가 감사한다. 구현물에는 테스트·게이트가 있는데
-# 판단물(원인 판정·우선순위·"X 가 없다")은 아무 검사 없이 구현으로 흘러갔다.
-# DESIGN.md 보다 새로우면 재사용한다 — 설계가 새로 돌면 판정도 다시 받아야 한다.
-if [ -f "$WORK/JUDGE.md" ] && [ "$WORK/JUDGE.md" -nt "$WORK/DESIGN.md" ] \
-   && [ "$(grep -m1 '^STATUS:' "$WORK/JUDGE.md" | awk '{print $2}')" = "DONE" ]; then
-  log "↺ 기존 JUDGE.md 재사용 (DESIGN.md 보다 최신)"
-  state "REUSED:judge" "기존 산출물 재사용"
-else
-  run_stage judge "$MODEL_JUDGE" "$FALLBACK_JUDGE" "$PROMPTS/judge.md" "$WORK/JUDGE.md"
-fi
-
-# ★ 판정권은 셸에 있다. 에이전트가 쓴 '판정' 문장을 읽지 않고, 자기가 신고한
-#   카운트 한 줄만 파싱한다. 형식이 없으면 그것도 게이트 위반이다.
-JUDGE_COUNTS="$(grep -m1 -E '^UNVERIFIED: *[0-9]+ +REFUTED: *[0-9]+' "$WORK/JUDGE.md" || true)"
-if [ -z "$JUDGE_COUNTS" ]; then
-  die "JUDGE.md 에 'UNVERIFIED: <n> REFUTED: <n>' 라인이 없다 → $WORK/JUDGE.md"
-fi
-UNVERIFIED="$(sed -E 's/^UNVERIFIED: *([0-9]+).*/\1/' <<<"$JUDGE_COUNTS")"
-REFUTED="$(sed -E 's/.*REFUTED: *([0-9]+).*/\1/' <<<"$JUDGE_COUNTS")"
-log "판단 검증: 미확인 $UNVERIFIED / 반박 $REFUTED"
-
-if [ "$UNVERIFIED" -gt 0 ] || [ "$REFUTED" -gt 0 ]; then
-  state "JUDGE_FLAGGED" "미확인 $UNVERIFIED / 반박 $REFUTED" \
-    "$WORK/JUDGE.md 의 반박·미확인 항목을 사람에게 보여주고 판단을 받아라. 승인 없이 구현으로 넘기지 마라."
-  gate_human \
-    "설계의 주장 중 반박 $REFUTED 건·미확인 $UNVERIFIED 건 — 이대로 구현하면 그 위에 코드가 쌓인다" \
-    "$WORK/JUDGE.md" 1
-fi
-
-gate_human "설계 검토 — 여기서 틀리면 뒤가 전부 낭비다" "$WORK/DESIGN.md"
-
 # ─────────────────────────────────────────── 게이트 5: 보호 파일 (프로젝트 전용)
 # CLAUDE.md 가 "손대면 안 되는 것"으로 못박은 파일들이다. 프롬프트에도 적혀 있지만
 # 프롬프트는 게이트가 아니다 — 에이전트가 안 지켰을 때 막는 것이 없다.
+#
+# **이 블록의 위치가 곧 검사 범위다** (2026-08-28 이동). 이 스크립트는 순차 실행이라
+# PROTECTED_BASELINE 이 찍히는 시점 **이전**의 변경은 기준선에 흡수돼 영원히 안 잡힌다.
+# 그전까지 이 블록은 design·judge 뒤에 있었고, 그래서 두 단계는 검사 밖이었다 —
+# 하필 PRD.md 를 가장 많이 읽는 단계들이다. 첫 에이전트보다 앞으로 옮기지 않으면
+# PROTECTED 에 무엇을 넣든 design·judge 에는 효력이 없다.
+# **어떤 run_stage 보다 위에 두어라.**
 #
 # git diff 대신 지문 비교를 쓰는 이유: 파이프라인 시작 시점에 이미 더러운 워킹
 # 트리(예: 이 파일들 자체를 커밋 안 한 상태)에서 돌리면 diff 기반 검사가 첫 시도부터
@@ -828,7 +795,14 @@ gate_human "설계 검토 — 여기서 틀리면 뒤가 전부 낭비다" "$WOR
 # 존재하지 않는 설정 파일도 목록에 둔다. protected_fingerprint 는 없는 파일을
 # "(없음)" 으로 찍으므로, 에이전트가 ruff.toml·mypy.ini 를 **새로 만들어** 게이트를
 # 느슨하게 하는 경로도 지문 변화로 잡힌다.
-PROTECTED="pyproject.toml requirements.txt requirements-dev.txt setup.cfg pytest.ini mypy.ini ruff.toml .ruff.toml conftest.py tests/conftest.py .gitignore AGENTS.md .env.example"
+#
+# PRD.md 가 포함된 이유 (2026-08-28): 이 파일은 파이프라인의 **유일한 요구사항 정본**이다.
+# design.md 는 "가장 먼저 읽는다"로, judge.md 는 "설계의 FR 인용을 PRD 원문과 대조한다"로
+# PRD 를 기준선으로 쓴다. 기준선 자체를 에이전트가 고칠 수 있으면 대조가 무의미해진다 —
+# 수용 기준을 느슨하게 고친 뒤 "PRD 와 일치한다"고 판정하는 경로가 열린다.
+# 사람이 PRD 를 개정하는 것은 정상이고(v1.1.1·v1.1.2 가 그랬다), 그때는 다음 주행이
+# 재승인을 한 번 요구할 뿐이다.
+PROTECTED="pyproject.toml requirements.txt requirements-dev.txt setup.cfg pytest.ini mypy.ini ruff.toml .ruff.toml conftest.py tests/conftest.py .gitignore AGENTS.md .env.example PRD.md"
 
 sha() { command -v shasum >/dev/null && shasum -a 256 "$1" || sha256sum "$1"; }
 
@@ -855,6 +829,54 @@ check_protected() {
   [ -z "$changed" ] \
     || die "$stage 단계가 보호 파일을 수정함: $changed — git checkout 으로 되돌린 뒤 설계부터 다시 볼 것"
 }
+
+
+if [ "$FRESH_DESIGN" != "1" ] && [ -f "$WORK/DESIGN.md" ] \
+   && [ "$(grep -m1 '^STATUS:' "$WORK/DESIGN.md" | awk '{print $2}')" = "DONE" ]; then
+  log "↺ 기존 DESIGN.md 재사용 ($(date -r "$WORK/DESIGN.md" '+%m-%d %H:%M') 생성) — 새로 뽑으려면 FRESH_DESIGN=1"
+  state "REUSED:design" "기존 산출물 재사용"
+else
+  run_stage design "$MODEL_DESIGN" "$FALLBACK_DESIGN" "$PROMPTS/design.md" "$WORK/DESIGN.md"
+fi
+
+# design.md:8 이 PRD·src 를 "읽기만, 절대 수정 금지"로 못박지만 프롬프트는 게이트가 아니다.
+check_protected design
+
+# ─────────────────────────────────────────── 판단 검증
+# 설계의 '주장'을 별 프로세스가 감사한다. 구현물에는 테스트·게이트가 있는데
+# 판단물(원인 판정·우선순위·"X 가 없다")은 아무 검사 없이 구현으로 흘러갔다.
+# DESIGN.md 보다 새로우면 재사용한다 — 설계가 새로 돌면 판정도 다시 받아야 한다.
+if [ -f "$WORK/JUDGE.md" ] && [ "$WORK/JUDGE.md" -nt "$WORK/DESIGN.md" ] \
+   && [ "$(grep -m1 '^STATUS:' "$WORK/JUDGE.md" | awk '{print $2}')" = "DONE" ]; then
+  log "↺ 기존 JUDGE.md 재사용 (DESIGN.md 보다 최신)"
+  state "REUSED:judge" "기존 산출물 재사용"
+else
+  run_stage judge "$MODEL_JUDGE" "$FALLBACK_JUDGE" "$PROMPTS/judge.md" "$WORK/JUDGE.md"
+fi
+
+# judge 는 확인용 임시 파일을 만들 수 있는 유일한 읽기 단계다 (judge.md:117).
+# 그 재량이 보호 파일까지 번지지 않았는지 여기서 본다.
+check_protected judge
+
+# ★ 판정권은 셸에 있다. 에이전트가 쓴 '판정' 문장을 읽지 않고, 자기가 신고한
+#   카운트 한 줄만 파싱한다. 형식이 없으면 그것도 게이트 위반이다.
+JUDGE_COUNTS="$(grep -m1 -E '^UNVERIFIED: *[0-9]+ +REFUTED: *[0-9]+' "$WORK/JUDGE.md" || true)"
+if [ -z "$JUDGE_COUNTS" ]; then
+  die "JUDGE.md 에 'UNVERIFIED: <n> REFUTED: <n>' 라인이 없다 → $WORK/JUDGE.md"
+fi
+UNVERIFIED="$(sed -E 's/^UNVERIFIED: *([0-9]+).*/\1/' <<<"$JUDGE_COUNTS")"
+REFUTED="$(sed -E 's/.*REFUTED: *([0-9]+).*/\1/' <<<"$JUDGE_COUNTS")"
+log "판단 검증: 미확인 $UNVERIFIED / 반박 $REFUTED"
+
+if [ "$UNVERIFIED" -gt 0 ] || [ "$REFUTED" -gt 0 ]; then
+  state "JUDGE_FLAGGED" "미확인 $UNVERIFIED / 반박 $REFUTED" \
+    "$WORK/JUDGE.md 의 반박·미확인 항목을 사람에게 보여주고 판단을 받아라. 승인 없이 구현으로 넘기지 마라."
+  gate_human \
+    "설계의 주장 중 반박 $REFUTED 건·미확인 $UNVERIFIED 건 — 이대로 구현하면 그 위에 코드가 쌓인다" \
+    "$WORK/JUDGE.md" 1
+fi
+
+gate_human "설계 검토 — 여기서 틀리면 뒤가 전부 낭비다" "$WORK/DESIGN.md"
 
 while :; do
   ATTEMPT=$((ATTEMPT + 1))

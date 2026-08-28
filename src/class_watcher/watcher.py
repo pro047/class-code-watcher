@@ -27,6 +27,12 @@ from .config import (
     WatchConfig,
 )
 from .debounce import Debouncer, EventKind, LogicalEvent, RawEvent
+from .diffgen import (
+    DiffResult,
+    change_stats_fields,
+    generate_session_diff,
+    watched_file_entries,
+)
 from .eventlog import append_jsonl, event_row
 from .selector import Selection, is_watched
 from .session import SessionPaths, SessionStatus, transition, write_session_json
@@ -231,6 +237,45 @@ class _Session:
             write_manifest(slot, result)
 
 
+def _diff_console_line(result: DiffResult) -> str:
+    """PRD 10.1 의 [DIFF] 한 줄. 건너뛴 파일이 없으면 뒷부분을 붙이지 않는다."""
+    line = (
+        f"[DIFF] {result.files_changed}개 파일 변경 "
+        f"(+{result.added_lines} / -{result.deleted_lines})"
+    )
+    if not result.skipped:
+        return line
+    reasons = sorted({item.skip_reason for item in result.skipped if item.skip_reason})
+    return f"{line}, {len(result.skipped)}개 건너뜀({', '.join(reasons)})"
+
+
+def _generate_diff(
+    state: "_Session", statuses: Mapping[str, str], ended_at: str
+) -> DiffResult | None:
+    """diff 산출물 생성. 통째로 실패해도 세션을 죽이지 않는다 (PRD 12절 복구 원칙)."""
+    try:
+        result = generate_session_diff(
+            state.paths,
+            statuses,
+            event_count=state.event_count,
+            started_at=str(state.doc.get("started_at", "")),
+            ended_at=ended_at,
+        )
+    except OSError as exc:
+        append_jsonl(
+            state.paths.errors_jsonl,
+            {
+                "timestamp": datetime.now().astimezone().isoformat(),
+                "stage": "diff",
+                "error": type(exc).__name__,
+            },
+        )
+        state.emit("[WARN] diff 생성에 실패했습니다. baseline/final 스냅샷은 그대로 남습니다.")
+        return None
+    state.emit(_diff_console_line(result))
+    return result
+
+
 def _drain_queue(sink: "queue.Queue[RawEvent]", debouncer: Debouncer) -> None:
     """큐를 짧게 기다렸다가 쌓인 것을 한 번에 흡수한다."""
     deadline = debouncer.next_deadline()
@@ -303,6 +348,9 @@ def _finalize(
     aborted = False
     unstable = False
     statuses: dict[str, str] = {}
+    diff_result: DiffResult | None = None
+    # stats.json 과 session.json 이 서로 다른 시각을 말하면 같은 세션으로 안 보인다.
+    ended_at: str | None = None
     try:
         while True:
             try:
@@ -331,10 +379,15 @@ def _finalize(
         final = SnapshotResult(metas=final.metas, unstable=unstable)
         write_manifest(state.paths.final_dir, final)
         statuses = compute_statuses(state.baseline_hashes, hash_map(final))
+        ended_at = datetime.now().astimezone().isoformat()
+        # no_change 세션은 diff 산출물을 만들지 않는다 (FR-035 경로 불변).
+        if not is_no_change(statuses):
+            diff_result = _generate_diff(state, statuses, ended_at)
     except KeyboardInterrupt:
         aborted = True
 
-    ended_at = datetime.now().astimezone().isoformat()
+    if ended_at is None:
+        ended_at = datetime.now().astimezone().isoformat()
     if aborted:
         state.write_status(
             SessionStatus.FAILED,
@@ -353,12 +406,22 @@ def _finalize(
 
     no_change = is_no_change(statuses)
     changed = sum(1 for status in statuses.values() if status != STATUS_UNCHANGED)
+    if diff_result is None:
+        # diff 를 못 돌린 세션(no_change 또는 생성 실패)은 라인 수를 주장하지 않는다.
+        watched_files: list[dict[str, str]] = [
+            {"path": rel, "status": status} for rel, status in statuses.items()
+        ]
+        change_stats: dict[str, object] = {
+            "files_changed": changed,
+            "events": state.event_count,
+        }
+    else:
+        watched_files = watched_file_entries(statuses, diff_result)
+        change_stats = change_stats_fields(diff_result, state.event_count)
     fields: dict[str, object] = {
         "ended_at": ended_at,
-        "watched_files": [
-            {"path": rel, "status": status} for rel, status in statuses.items()
-        ],
-        "change_stats": {"files_changed": changed, "events": state.event_count},
+        "watched_files": watched_files,
+        "change_stats": change_stats,
         "no_change": no_change,
     }
     if no_change:

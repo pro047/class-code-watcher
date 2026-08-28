@@ -226,6 +226,9 @@ def test_no_change_session_completes(
     assert doc["no_change"] is True
     assert doc["watched_files"] == [{"path": "a.py", "status": "unchanged"}]
     assert "error" not in doc
+    # 기준 17 · FR-035 경로 불변: no_change 세션은 diff 산출물을 만들지 않는다.
+    assert not paths.final_diff.exists()
+    assert not paths.stats_json.exists()
     # 기준 31 의 절반: 콘솔 라인은 전부 주입된 emit 으로만 나간다 — print 직접 사용 금지.
     assert lines
     captured = capsys.readouterr()
@@ -269,14 +272,32 @@ def test_changed_session_is_partial_and_preserves_artifacts(
         Secrets(openai_api_key=None, discord_webhook_url=None),
     )
     assert rc == cli.EXIT_RUNTIME
-    capsys.readouterr()
+    # PRD 10.1 의 [DIFF] 콘솔 한 줄 — 건너뛴 파일이 없으면 뒷부분이 붙지 않는다.
+    assert "[DIFF] 1개 파일 변경 (+1 / -1)" in capsys.readouterr().out
 
     doc = _session_doc(paths)
     assert doc["status"] == "partial"
     assert doc["error"] == watcher.PENDING_PIPELINE_ERROR
     assert doc["no_change"] is False
     assert doc["watched_files"] == [{"path": "a.py", "status": "modified"}]
-    assert doc["change_stats"] == {"files_changed": 1, "events": 1}
+    # diff 단계가 PRD 9.2 의 4필드를 채운다 (설계 기준 16).
+    assert doc["change_stats"] == {
+        "files_changed": 1,
+        "events": 1,
+        "added_lines": 1,
+        "deleted_lines": 1,
+    }
+    # 기준 16: diff 산출물이 세션 디렉터리에 남고, 시각은 session.json 과 같은 문자열이다.
+    assert "--- a/a.py" in paths.final_diff.read_text(encoding="utf-8")
+    stats = json.loads(paths.stats_json.read_text(encoding="utf-8"))
+    assert stats["totals"] == {
+        "files_changed": 1,
+        "added_lines": 1,
+        "deleted_lines": 1,
+        "skipped": 0,
+    }
+    assert stats["started_at"] == doc["started_at"]
+    assert stats["ended_at"] == doc["ended_at"]
     # 산출물 보존: baseline 은 시작 시점, final 은 종료 시점 바이트다.
     assert (paths.baseline_dir / "a.py").read_bytes() == b"x = 1\n"
     assert (paths.final_dir / "a.py").read_bytes() == b"x = 2\n"
@@ -337,6 +358,80 @@ def test_deleted_file_recorded_with_null_digest(
     assert row["event_type"] == "deleted"
     assert row["hash"] is None
     assert row["size"] is None
+
+
+# ── diff 통합 지점 — 설계 5.6 과 PRD 12절 복구 원칙 ──────────────────────────
+
+
+def test_binary_only_change_is_skipped_but_not_no_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 설계 5.6: 해시상 변경은 있으나 diff 가능 파일이 0개인 세션 — 사실만 기록한다.
+    config, paths, selection = _setup_session(tmp_path)
+    root = config.watch_root
+
+    def change(debouncer: Debouncer) -> None:
+        (root / "a.py").write_bytes(b"\x00\x01\x02")
+        debouncer.observe(RawEvent(rel_path="a.py", kind="modified", at=0.0))
+
+    _script_loop(monkeypatch, [change])
+    lines: list[str] = []
+    run_session(config, paths, selection, lines.append)
+
+    doc = _session_doc(paths)
+    assert doc["no_change"] is False  # no_change 판정은 해시 기준 그대로다
+    assert doc["watched_files"] == [{"path": "a.py", "status": "skipped", "reason": "binary"}]
+    assert doc["change_stats"] == {
+        "files_changed": 0,
+        "events": 1,
+        "added_lines": 0,
+        "deleted_lines": 0,
+    }
+    # 산출물만 봐도 제외 사실이 남는다 (PRD 9.2 skipped 예시와 같은 형태).
+    assert paths.final_diff.read_text(encoding="utf-8") == "# skipped: a.py (binary)\n"
+    assert "[DIFF] 0개 파일 변경 (+0 / -0), 1개 건너뜀(binary)" in lines
+
+
+def test_diff_failure_logs_error_and_keeps_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PRD 12절 복구 원칙: diff 생성이 통째로 실패해도 세션은 계속되고 스냅샷은 남는다.
+    config, paths, selection = _setup_session(tmp_path)
+    root = config.watch_root
+
+    def change(debouncer: Debouncer) -> None:
+        (root / "a.py").write_bytes(b"x = 2\n")
+        debouncer.observe(RawEvent(rel_path="a.py", kind="modified", at=0.0))
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise OSError("디스크 꽉 참")
+
+    _script_loop(monkeypatch, [change])
+    monkeypatch.setattr(watcher, "generate_session_diff", boom)
+    lines: list[str] = []
+    outcome = run_session(config, paths, selection, lines.append)
+
+    assert outcome.aborted is False
+    doc = _session_doc(paths)
+    assert doc["status"] == "partial"
+    # 라인 수를 세지 못한 세션은 0 을 주장하지 않는다 — 기존 2필드 형태 유지 (IMPL).
+    assert doc["change_stats"] == {"files_changed": 1, "events": 1}
+    assert doc["watched_files"] == [{"path": "a.py", "status": "modified"}]
+    [row] = [
+        json.loads(line)
+        for line in paths.errors_jsonl.read_text(encoding="utf-8").splitlines()
+    ]
+    assert row["stage"] == "diff"
+    assert row["error"] == "OSError"
+    assert row["timestamp"]
+    # 예외 메시지 원문은 기록하지 않는다 — 경로·환경 정보가 새는 통로를 만들지 않는다.
+    assert "디스크 꽉 참" not in json.dumps(row, ensure_ascii=False)
+    assert any(line.startswith("[WARN]") for line in lines)
+    assert not paths.final_diff.exists()
+    assert not paths.stats_json.exists()
+    # 스냅샷은 그대로 남는다.
+    assert (paths.baseline_dir / "a.py").read_bytes() == b"x = 1\n"
+    assert (paths.final_dir / "a.py").read_bytes() == b"x = 2\n"
 
 
 # ── 기준 29: 상태 전이 starting→watching→finalizing→(completed|partial) (FR-040) ──

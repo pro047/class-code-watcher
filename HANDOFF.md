@@ -2,10 +2,10 @@
 
 - 기준 문서: `PRD.md` v1.1.2 (14절 MVP 단계별 개발 계획)
 - 갱신 시점: 2026-08-28
-- 기준 커밋: `3f2b543` (main)
-- 한 줄 요약: **0·1·2단계 완료 — 테스트 147개, 게이트 3종 녹색. 2단계는 재시도 0회로
-  닫혔다 — 하네스 결함 5건이 전부 고쳐진 뒤 도는 첫 주행이었고 예고대로 깨끗했다.
-  다음은 3단계 "정제"(0.5일).**
+- 기준 커밋: `e0b4837` (main)
+- 한 줄 요약: **0~3단계 완료 — 테스트 192개, 게이트 3종 녹색. 3단계 "정제"가 닫히면서
+  이 프로젝트에서 되돌릴 수 없는 사고가 나는 유일한 지점(비밀값 유출)에 방어선이 섰다.
+  다음은 4단계 "LLM"(1일) — 여기부터 `.env` 에 실제 키가 필요하다.**
 
 ---
 
@@ -130,8 +130,10 @@ jq -Rr 'fromjson? // empty | select(.type?=="assistant") | .message.content[]?
 | `9b997c5`·`c42ded2` | 1단계 실기기 확인 4건 반영 + 거기서 나온 결함 2건 수정 |
 | `cd730af` | 2단계 작업 내용을 핸드오프에 반영 |
 | `3f2b543` | **2단계 diff 엔진 — 테스트 147개, 게이트 3종 통과. 2단계 완료** |
+| `86a149b`·`23f1d98` | 핸드오프 갱신 — 2단계 실기기 확인 3건, `session.json` 사용자명 누출 기록 |
+| `e0b4837` | **3단계 정제 — `redact.py` 신규, 테스트 192개, 게이트 3종 통과. 3단계 완료** |
 
-### 0·1·2단계 산출물 — 소스 12모듈 / 테스트 147개
+### 0~3단계 산출물 — 소스 13모듈 / 테스트 192개
 
 | 소스 | 단계 | 역할 |
 |---|---|---|
@@ -146,12 +148,18 @@ jq -Rr 'fromjson? // empty | select(.type?=="assistant") | .message.content[]?
 | `snapshot.py` | 1 | baseline/final/history, SHA-256, meta |
 | `watcher.py` | 1→2 | watchdog 배선·감시 루프·finalize (**부작용 층, 얇게**) + diff 호출 1지점 |
 | `diffgen.py` | 2 | FR-020·022·023·024 — 순수 함수 9개 + 부작용 3개. git 호출 0건 |
+| `redact.py` | 3 | FR-036·037·038 — 규칙 11종 + `.env` 백스톱, 스캔·마스킹·환경정제. **매치 원문을 담는 자료구조가 없다** |
 
-테스트 11파일 2428줄 / **147 케이스**. `test_watcher.py`(617줄)와 `test_diffgen.py`(410줄)가
-가장 크다. 둘 다 실물을 안 띄운다 — 전자는 Observer 없이 이벤트 정규화·finalize 판정만,
-후자는 감시 루트조차 만들지 않고 스냅샷 바이트만으로 전 경로를 검사한다.
+`watcher.py` 는 3단계에서 정제 호출 1지점(`watcher.py:460`)이 늘었다 — diff 성공 직후에만 돈다.
 
-**게이트 실측 (2026-08-28):** `pytest` 147 passed / `ruff` All checks passed / `mypy` 12 files.
+테스트 12파일 3136줄 / **192 케이스**. `test_watcher.py`(876줄) · `test_cli.py`(450줄) ·
+`test_redact.py`(418줄) · `test_diffgen.py`(413줄) 넷이 대부분이다. 전부 실물을 안 띄운다 —
+`test_redact.py` 는 세션조차 만들지 않고 문자열만으로 전 규칙을 검사한다.
+
+**게이트 실측 (2026-08-28, macOS / Python 3.12.11):**
+`pytest` **192 passed** / `ruff` All checks passed / `mypy` **13 files**.
+파일별 케이스 수: cli 26 / config 13 / debounce 14 / diffgen 23 / eventlog 3 /
+**redact 36** / selector 17 / session 9 / snapshot 5 / stability 6 / watcher 30 / watchmode 10.
 
 ### 0단계 주행 기록 — 두 번 죽고 세 번째에 닫혔다
 
@@ -228,6 +236,47 @@ impl 은 자기가 뭘 어겼는지 볼 수 없었다 — 눈을 가린 채 린�
 
 **파이프라인 밖에서 결함 1건을 같이 닫았다** — 6절 관례. 5절 (마) 참조.
 
+### 3단계 주행 (08-28) — 커밋 `e0b4837`
+
+**주의: 이 절은 코드·커밋만으로 재구성했다.** 주행은 다른 PC 에서 돌았고 `.pipeline/redactor/`
+는 이 리포에 없다 (2.1 절 — 커밋 대상이 아니라 돌린 PC 에만 있다). 따라서 **단계별 비용·턴 수·
+재시도 횟수는 여기 없다.** 그 PC 에서 `jq -r '.total_cost_usd' .pipeline/redactor/*.result.json`
+으로 뽑아 이 표를 채워라 — 4단계 예산 산정의 유일한 근거다.
+
+산출물로 확인된 것: `redact.py` 373줄 신규, `watcher.py` +84줄, `cli.py` +7줄,
+`session.py` +3줄, 테스트 3파일 +725줄. 소스와 테스트가 한 커밋에 같이 들어왔고
+게이트 3종이 녹색이다.
+
+#### judge 판정 6건이 실제로 어떻게 풀렸나 (전부 `코드 확인`)
+
+5절 (나) 가 "judge 가 물고 늘어질 지점"으로 예고한 6건이다. **4번과 6번은 예고와 다르게
+풀렸다** — 후속 단계가 문서만 믿으면 틀린다.
+
+| # | 쟁점 | 결론 | 근거 |
+|---|---|---|---|
+| 1 | `redaction.json` 스키마 | `schema_version: "1.1"`. **탐지 원문을 담을 필드가 없다** — `SecretFinding` 이 `(rule_id, rel_path, line_no)` 뿐 | `redact.py:87` |
+| 2 | 스캔 범위 | diff 본문 **+ 파일 경로 목록** 둘 다 스캔. 다만 **마스킹은 본문에만** — "경로를 가리면 요약이 무슨 파일인지 말할 수 없다" | `redact.py:282,296` |
+| 3 | 사용자명 하한 | `MIN_BARE_USERNAME_LENGTH = 6`. 미만이면 맨몸 치환을 건너뛰고 `bare_username_skipped` 로 **건너뛴 사실을 기록** | `redact.py:30` |
+| 4 | 종료 코드 충돌 | **`error` 뿐 아니라 `status` 까지 갈랐다.** 탐지-중단 = `failed` + `secrets_detected`, 과도기 = `partial` + `summary_pipeline_not_implemented`. 종료 코드는 **둘 다 1** | `watcher.py:509,512` |
+| 5 | 오탐 정책 | 완화 정책을 만들지 않고 `by_rule`(규칙별 건수)을 `redaction.json`·`session.json` 양쪽에 남긴다 — 파일럿 데이터를 모으는 쪽 | `redact.py:315` |
+| 6 | 정제본을 어디에 두나 | **어디에도 안 둔다.** `RedactionResult.text` 는 메모리에만 있고 `run_session` 이 끝나면 사라진다 — `WatchOutcome` 이 나르는 것은 `secrets_blocked: bool` 하나다 | `watcher.py:79` |
+
+**6번이 4단계 설계의 첫 입력이다.** `final.diff` 는 원본 그대로 남고 `redaction.json` 에도
+본문이 없으므로, 4단계는 정제본을 **넘겨받는 게 아니라 다시 만들어야 한다.** `redact_diff` 를
+4단계가 직접 부르든 `WatchOutcome` 의 반환 경로를 넓히든, 어느 쪽인지 설계가 정해야 한다.
+
+#### 스캐너 규칙 — 11종 + 백스톱 1
+
+`private_key_header` / `openai_api_key` / `aws_access_key_id` / `github_token` / `slack_token` /
+`jwt` / `bearer_token` / `discord_webhook` / `url_credentials` / `jdbc_credentials` /
+`assignment_secret`, 그리고 **`known_secret`** — `.env` 의 실제 값을 정확 일치로 거는
+백스톱이다(8자 이상만). 벤더 키 형식이 바뀌어 정규식이 헛나가도 내 키는 형식과 무관하게
+잡힌다. 규칙 표는 `redact.py:50` 한 곳이고 한 행이 한 규칙이다.
+
+스캔 순서가 설계 결정이다 — **원문에 먼저 스캔을 돌리고 그다음에 마스킹·환경정제**를 한다.
+환경정제가 먼저 돌면 커넥션 문자열 속 사용자명이 치환되면서 비밀값 패턴이 깨져 검사를
+빠져나갈 수 있다 (`redact.py:278` 이 이유를 적어놨다).
+
 ## 4. 마일스톤 (PRD 14절) 대비 진척
 
 | 단계 | 범위 | 완료 기준 | 예상 | 상태 |
@@ -235,27 +284,31 @@ impl 은 자기가 뭘 어겼는지 볼 수 없었다 — 눈을 가린 채 린�
 | **0. 골격** | CLI, 설정, 세션 디렉터리, 로깅 | 잘못된 입력/정상 시작의 자동 테스트 | 0.5일 | ✅ **완료** (`092594a`) |
 | **1. 감시** | baseline(다중 파일), watchdog, debounce, flush+안정화, final | 저장·원자적 교체·삭제/재생성·신규 파일 시나리오 통과 | **2일** | ✅ **완료** (`9f8c03c`) |
 | **2. Diff** | difflib, 바이너리/대용량 제외, 파일별·합산 통계 | 다중 파일 fixture 결과 검증 | 0.5일 | ✅ **완료** (`3f2b543`) |
-| **3. 정제** | secret scanner, 경로 상대화, 환경정보 제거 | 키 패턴 fixture 전량 탐지, 마스킹 테스트 | 0.5일 | ⬜ **다음 차례** — 범위·판정 지점은 5절 (나) |
-| 4. LLM | 프롬프트, strict schema, 1회 호출 + 1회 재시도, fallback | mock 기반 호출 횟수·스키마·timeout 테스트 | 1일 | ⬜ 미착수 |
+| **3. 정제** | secret scanner, 경로 상대화, 환경정보 제거 | 키 패턴 fixture 전량 탐지, 마스킹 테스트 | 0.5일 | ✅ **완료** (`e0b4837`) |
+| **4. LLM** | 프롬프트, strict schema, 1회 호출 + 1회 재시도, fallback | mock 기반 호출 횟수·스키마·timeout 테스트 | 1일 | ⬜ **다음 차례** — 범위·판정 지점은 5절 (나) |
 | 5. Discord | 메시지 렌더링, 모바일 가독성, Webhook, 실패 보존 | 204/4xx/5xx mock 테스트 | 0.5일 | ⬜ 미착수 |
 | 6. 통합 | 상태 전이, 종료 코드, 마스킹 E2E | E2E 10회 연속 성공, 오류별 산출물 검증 | 1일 | ⬜ 미착수 |
 | 7. 배포 | PyInstaller 단일 exe, `.env` 템플릿, USB 실행 검증 | Python 없는 PC에서 실행 성공 | 0.5일 | ⬜ 미착수 |
 
-합계 6.5일 중 3일 완료 — **약 46%**.
+합계 6.5일 중 3.5일 완료 — **약 54%**.
 
 1단계는 자동 테스트뿐 아니라 **실기기 확인 6건 중 4건까지 통과**했다 (5절 가).
 남은 2건(폴링 전환·자원 사용)은 진행을 막지 않는다.
 2단계도 **실기기 확인 5건 중 3건까지 통과**했다 (5절 가) — diff 가독성·통계 정확도·
 경로 누출 없음이 실물 세션으로 확인됐다. 남은 2건(git 미설치·cp949 리다이렉트)은
-3단계 진행을 막지 않는다.
+4단계 진행을 막지 않는다.
+**3단계는 실기기 확인이 아직 0건이다** (5절 가) — 자동 테스트 36케이스는 전부 문자열
+단위라, 실제 키를 심은 세션이 정말 차단되는지는 사람만 확인할 수 있다.
 
-부수 체크리스트는 아직 전량 미완이다:
-- PRD 14.1 MVP 테스트 체크리스트 **19항목** — 0단계 범위 밖 항목이 대부분이라 그대로다
+부수 체크리스트:
+- PRD 14.1 MVP 테스트 체크리스트 19항목 중 **2항목이 자동 테스트 수준에서 닫혔다** —
+  FR-036(키 fixture 전량 탐지·전송 차단), FR-037(절대 경로·사용자명 미포함).
+  **실기기 확인은 아직이다** — 위 문단 참조
 - PRD 18절 DoD **7조건** 전부 미충족
 
 ## 5. 다음에 할 일
 
-### (가) 사람만 할 수 있는 것 — 실기기 확인 (1단계 6건 중 4건 통과, 2단계 5건 미착수)
+### (가) 사람만 할 수 있는 것 — 실기기 확인 (1단계 4/6, 2단계 3/5, **3단계 0/2**)
 
 `VERIFY.md` 5절의 체크리스트다. watchdog 실이벤트·신호·실기기 의존이라 테스트로 못 덮는다.
 **1·2·3·5번을 실기기로 통과시켰다 — 감시 엔진이 실제로 돈다는 것이 확인됐다.**
@@ -324,76 +377,94 @@ impl 은 자기가 뭘 어겼는지 볼 수 없었다 — 눈을 가린 채 린�
    아예 빠졌다(설계대로). 덤으로 `final/` 스냅샷이 실물과 바이트 동일, `unstable: false`,
    종료 코드 1(과도기 매핑)도 같이 확인됐다
 
-### (나) 3단계 "정제" (0.5일) — 다음 차례
+**3단계 실기기 확인 2건 — 아직 0건 통과.** 자동 테스트 36케이스는 전부 문자열 단위라
+"실제로 막히는가"를 한 번도 안 봤다. 4단계가 붙기 전에 여기서 걸러야 하는 이유는,
+4단계부터는 검증에 실패하면 **실제로 외부로 나간다**는 것이다.
 
-2단계가 만든 `final.diff` 를 읽어 **외부로 나가기 전에** 비밀값을 막고 환경 정보를 지운다.
-감시도 diff 도 건드리지 않는다. **이 프로젝트에서 되돌릴 수 없는 사고가 나는 유일한 지점이다**
-— PRD 2절이 "diff에 섞인 키가 요약에 실리면 팀 채널에 그대로 남고 5명에게 알림이 간다.
-삭제해도 이미 본 뒤다" 라고 적은 그 자리다 (C-14 로 인젝션보다 상위 위협으로 승격됐다).
+1. ⬜ **심은 키가 실제 세션에서 차단되는가** (FR-036, PRD 14.1) — 감시 대상 파일에
+   `sk-` 로 시작하는 가짜 키 한 줄을 넣고 저장한 뒤 Ctrl+C. 기대값:
+   콘솔에 `[SCAN] … 외부 전송을 중단합니다`, `session.json` 이 `status: failed` +
+   `error: "secrets_detected"`, 종료 코드 **1**, 그리고 **`final.diff`·`baseline/`·`final/`
+   이 전부 남아 있을 것** (FR-036 은 전송만 막고 로컬 산출물은 보존한다).
+   `redaction.json` 에 **키 원문이 없는지**도 같이 눈으로 본다 — 없어야 정상이다
+2. ⬜ **`--allow-secrets` 로 마스킹 후 진행** (FR-038) — 같은 파일로 `--allow-secrets` 를
+   붙여 재실행. 기대값: `[SCAN] … 마스킹 후 진행합니다`, `session.json` 의
+   `redaction.secrets_found` 가 1 이상, `by_rule` 에 `openai_api_key` 가 잡힘.
+   **주의: 이 경로에서 정제본이 디스크에 안 남는다** — 3절 판정 6번. 마스킹이 실제로
+   먹었는지는 지금 눈으로 확인할 방법이 없고, 4단계가 프롬프트를 만들 때 처음 보인다
+
+### (나) 4단계 "LLM" (1일) — 다음 차례
+
+3단계가 만든 정제 결과를 프롬프트로 만들어 OpenAI 를 **세션당 1회** 부르고, 응답을
+`summary.json` 으로 남긴다. **여기부터 실제로 외부로 나간다** — 0~3단계는 전부 로컬이었다.
+`.env` 에 `OPENAI_API_KEY` 가 실제로 필요한 첫 단계다 (10절).
 
 **범위 — PRD 12절**
 
 | FR | 내용 | 우선 | 수용 기준 |
 |---|---|---|---|
-| FR-036 | 외부 전송 직전, 로컬 정규식 스캐너로 diff 검사 | **P0** | API 키·토큰·비밀번호·프라이빗 키 헤더·커넥션 문자열 탐지. 탐지 시 기본은 **전송 중단** + 종료 코드 1, **로컬 산출물은 전부 보존** |
-| FR-037 | 프롬프트에서 환경 정보 제거 | **P0** | 절대 경로 → 감시 루트 상대 경로, Windows 사용자명·내부 서버 주소는 제거 또는 치환된 상태로만 전송 |
-| FR-038 | `--allow-secrets` 지정 시 마스킹 후 진행 | P1 | 탐지 구간을 `[REDACTED]` 로 치환해 전송하고 `session.json` 에 탐지 건수·유형 기록 |
+| FR-030 | 세션 종료 시에만 호출, **정상 1회 / 상한 2회** | **P0** | 저장 이벤트 중 호출 0회. 스키마 검증 실패 시에만 1회 재시도하고 그 사실을 `session.json` 에 기록 |
+| FR-031 | **Structured Outputs (strict json_schema)** 로 스키마를 API 에 전달하고 수신 후 재검증 | **P0** | 요청에 strict 스키마 포함. 필수 필드 누락·타입 오류는 실패로 분류하고 원본 응답을 제한적으로 보관 |
+| FR-032 | **맥락 없는 독자 기준**으로 근거 중심 요약 | **P0** | diff 에 없는 사실은 추정으로 명시하거나 제외. 각 변경은 파일명·함수명 나열이 아니라 **무엇을 하는 코드인지 한 구절** |
+| FR-035 | 변경 없음 세션은 호출 0회 | **P0** | 이미 3단계까지 경로가 서 있다 — `is_no_change` 가드가 diff·정제를 건너뛴다 |
+| FR-039 | 재시도까지 실패하면 **규칙 기반 fallback 요약** | P1 | 파일별 통계 + 변경 함수/클래스 시그니처. **LLM 요약이 아님을 메시지에 명시** |
 
-**새 산출물 1개** (PRD 9.1): `redaction.json`. PRD 5절 단계 표의 "6. 검사 — 로컬 정규식
-secret scan, 환경정보 제거 → `redaction.json`" 이다.
+**새 산출물 1개** (PRD 9.1): `summary.json`. 응답 스키마 개요는 PRD 11.3 에 있다.
 
-**입력은 이미 전부 있다.** 2단계의 `final.diff`(a/·b/ 상대 경로 헤더)와 `stats.json`.
-**`--allow-secrets` 는 0단계가 이미 파싱해 `WatchConfig` 까지 나른다** (`cli.py:86,113`) —
-읽는 코드만 없다. 의존성 0 (정규식은 `re`).
-
-**2단계가 부담을 미리 줄여놨다.** diff 헤더 경로는 이미 `a/`·`b/` + POSIX 상대 경로다
-(2단계 설계 5.7 이 "3단계에서 절대 경로를 되돌려야 하는 상황"을 피하려고 그렇게 정했다).
-FR-037 에 남은 것은 **diff 본문 안에 문자열로 박힌** 절대 경로·사용자명이다.
+**입력은 3단계까지가 다 만들어놨다** — `final.diff`(원본) · `stats.json` · `redaction.json`.
+의존성도 이미 선언돼 있다 (`openai>=1.40`, `pyproject.toml`). **`PROTECTED` 라 에이전트가
+`pyproject.toml` 을 못 건드리니 추가 의존성이 필요하면 사람이 먼저 넣어야 한다** (8절).
 
 #### 설계 단계에서 판정이 필요한 것 — judge 가 물고 늘어질 지점
 
-1. **`redaction.json` 스키마** — PRD 9.1 이 이름만 적고 구조를 안 적었다. `stats.json` 과
-   똑같은 상황이고, 2단계가 `schema_version` 을 박아 대비한 전례가 있다.
-   **탐지 원문을 이 파일에 그대로 남기면 안 된다** — 유출 방지 산출물이 유출 경로가 된다
-2. **스캔 대상의 범위** — `final.diff` 본문만인가, 파일 **경로**도인가(`config/prod-key.pem`),
-   `stats.json` 의 경로 목록도인가. 프롬프트에 실리는 것 전부가 대상이어야 앞뒤가 맞는다.
-   **이 항목에 실측 근거가 있다** (2026-08-28 실기기 세션): `final.diff`·`stats.json` 은
-   `ksmart` 도 `C:\` 도 없이 깨끗한데, **`session.json` 에는 `"watch_root":
-   "C:\Users\ksmart\watcher-save-test"` 가 그대로 있다.** 지금은 로컬 산출물이라
-   무해하지만 4단계가 세션 메타데이터를 프롬프트에 실으면 거기서 사용자명이 샌다 —
-   FR-037 이 막아야 할 것이 정확히 이것이다
-3. **사용자명을 어떻게 아는가** — `ksmart` 를 하드코딩할 수 없다. `os.environ` 의
-   `USERNAME`/`USERPROFILE` 에서 얻는 것이 자연스럽지만, **그 값이 짧거나 흔한 단어면
-   (예: `dev`, `user`) 무관한 코드까지 치환한다.** 길이 하한이나 경계 조건이 필요하다
-4. **종료 코드 충돌** — FR-036 은 탐지 시 코드 1 인데, 지금 과도기 매핑은 **변경 있는 세션이
-   이미 코드 1** 이다 (`summary_pipeline_not_implemented`). 둘을 `session.json` 의 `error`
-   로 구분할 수 있어야 6단계 E2E 에서 판별이 된다
-5. **오탐 정책** — 오픈 이슈 3번이 걸려 있다. 기본이 전송 중단이라 오탐이 잦으면 도구가
-   못 쓰이게 된다. **다만 파일럿 전에는 실측 데이터가 없다** — 설계가 추측으로 완화 정책을
-   정하기보다 탐지 건수·유형을 `redaction.json` 에 남겨 판단 근거를 모으는 쪽이 맞다
-6. **정제된 diff 를 어디에 두는가** — `final.diff` 를 덮어쓰면 원본이 사라지고, 별도 파일로
-   두면 PRD 9.1 에 없는 산출물이 는다. 4단계가 **무엇을 읽어야 하는지**가 여기서 정해진다
+1. **정제본을 어디서 얻는가** — 3절 판정 6번이 여기로 넘어온 것이다. 정제된 diff 는
+   **디스크에 없고** `RedactionResult.text` 로 메모리에만 있다가 `run_session` 이 끝나며
+   사라진다. 4단계가 `redact_diff` 를 직접 다시 부를 것인가, `WatchOutcome` 을 넓혀
+   나르게 할 것인가. **원본 `final.diff` 를 그냥 읽으면 FR-036 방어선을 우회하는 것이다** —
+   이 선택지만은 안 된다
+2. **`session.json` 을 프롬프트에 실으면 FR-037 위반이다** — `watch_root` 가 절대 경로 +
+   Windows 사용자명 그대로다 (`session.py:120`, 2026-08-28 실측으로 `C:\Users\ksmart\…`
+   확인). 로컬 파일로는 그대로가 맞지만(PRD C-11), **프롬프트에 넣는 순간 새는 자리는
+   diff 가 아니라 여기다.** 3단계 방어선은 diff 본문·경로에만 쳐져 있다
+3. **차단된 세션에서 호출하지 않는 것** — `redaction.blocked` 면 보낼 본문 자체가 없다
+   (`RedactionResult.text` 가 `None` 이라 타입 수준에서 막혀 있다). 이 가드가 **호출 앞에**
+   있어야 한다. 순서가 뒤집히면 FR-036 의 전체 목적이 무너진다
+4. **호출 횟수를 무엇으로 세는가** — FR-030 은 "상한 2회"인데, 네트워크 재시도·SDK 내부
+   retry 가 이 계수에 포함되는지 PRD 가 안 적었다. **`openai` SDK 는 기본 `max_retries=2`
+   로 자동 재시도한다 (`추정` — 이 저장소에 정본 없음, 설계가 실측할 것).** 스키마 실패
+   재시도만 세고 전송 실패 재시도는 안 센다면 그 기준을 명시해야 6단계 E2E 가 판별한다
+5. **입력 크기 예산** — PRD 15절이 "세션당 입력 8k 토큰 이하"를 목표로 적었고 PRD 12절
+   위험표가 "변경량 큰 파일 우선, 절단 표시"를 말한다. **그런데 절단 규칙에 FR 번호가 없다.**
+   어디서 자르고 잘렸다는 사실을 어디에 남길지 설계가 정해야 한다
+6. **종료 코드·상태 매핑을 또 건드린다** — 지금 변경 있는 세션은 `partial` +
+   `summary_pipeline_not_implemented` 로 끝난다 (과도기). 4단계가 이 자리를 가져가는데,
+   **5단계 Discord 가 아직 없으므로 완전히 `completed` 로 갈 수는 없다.** 새 과도기 매핑을
+   어떻게 둘지, 그리고 3단계가 만든 `failed`+`secrets_detected` 와 충돌하지 않는지
+7. **테스트에서 실제 API 를 부르면 안 된다** — 게이트가 네트워크 없이 도는 PC 에서도
+   돌아야 한다. mock 경계를 SDK 클라이언트에 둘지 얇은 래퍼 함수에 둘지가 설계 사항이다
 
 #### 14.1 체크리스트에서 닫히는 것
 
-- [ ] fixture 에 심은 API 키·프라이빗 키·커넥션 문자열이 전량 탐지되고 전송이 차단된다 (FR-036)
-- [ ] 프롬프트에 절대 경로와 Windows 사용자명이 포함되지 않는다 (FR-037)
+- [ ] 정상 변경 세션의 OpenAI 호출은 1회, 변경 없음은 0회, 스키마 실패 시 최대 2회다
+- [ ] (부분) OpenAI 실패에도 baseline, final, diff, `session.json` 이 남는다
+- [ ] (사람만) 생성된 요약을 코드를 안 본 사람에게 보여줬을 때 이해된다 (FR-032)
 
 #### 주행
 
 ```bash
-BUDGET_JUDGE=8 BUDGET_VERIFY=10 PY=.venv/Scripts/python ./orchestrate.sh redactor
+BUDGET_JUDGE=8 BUDGET_VERIFY=10 PY=.venv/Scripts/python ./orchestrate.sh summarizer
 ```
 
 PowerShell 에서는 10절대로 `bash.exe` 를 거쳐야 한다. **DESIGN 게이트에서 exit 4 로 멈춘다**
-— 사람이 `approve.sh redactor DESIGN.md` 를 직접 실행하고 같은 명령으로 재실행하면 이어진다.
+— 사람이 `approve.sh summarizer DESIGN.md` 를 직접 실행하고 같은 명령으로 재실행하면 이어진다.
 
-**예산 근거**: 2단계 실적은 design $2.91 / judge $5.54 / impl $2.34 / verify $5.58 이다.
-judge 가 기본값 $5 를 넘겼으므로 `BUDGET_JUDGE=8` 은 유지한다.
+**예산 근거**: 2단계 실적이 design $2.91 / judge $5.54 / impl $2.34 / verify $5.58 = $16.4 다.
+3단계 실적은 이 리포에 없다 (3절). 4단계는 2단계보다 범위가 넓고(1일) 판정 지점이 7개라
+**judge·verify 가 더 길어질 것으로 본다** — `BUDGET_JUDGE=8`·`BUDGET_VERIFY=10` 을 유지한다.
 
-**깨질 테스트는 없을 것으로 본다** — 3단계는 새 모듈이고, 과도기 매핑을 건드리는 것은
-4·5단계다. 다만 판정 4번(종료 코드 충돌)을 설계가 어떻게 푸느냐에 따라
-`test_main_changed_session_ends_partial` 계열이 영향을 받을 수 있다.
+**깨질 테스트가 있다.** 판정 6번(과도기 매핑 교체)이 `test_cli.py`·`test_watcher.py` 의
+`summary_pipeline_not_implemented` 단언을 직접 건드린다. 2단계 때처럼 impl 이 `BLOCKED`
+대신 `DONE` + 인계로 넘기고 verify 가 고치는 경로(결함 ⑤ 예외)를 탈 것이다.
 
 ### (다) ✅ 해결됨 — cp949 에서 죽는 결함 (0단계 코드)
 
@@ -551,8 +622,27 @@ impl 이 주석 한 줄을 두 주행 내내 못 고친 것이 그 증거다.
   `events.jsonl`·`errors.jsonl` 은 **경로만 정의하고 파일을 만들지 않는다.**
 - preflight 실패(경로 없음 / 파일 / 읽기 불가 / 파일 수 상한 초과)는 `EXIT_CONFIG=2`, 이때
   **세션 디렉터리는 만들지 않는다** (`create_session_dirs` 가 preflight 뒤에 있다).
-- `pyproject.toml`·`.env*`·`.gitignore`·`PRD.md`·`requirements*.txt` 는 `orchestrate.sh` 의 `PROTECTED` 지문 감시 대상이다.
+- **`PROTECTED` 지문 감시 목록의 정본은 `orchestrate.sh:838` 한 줄이다** — 외우지 말고 그걸 봐라.
+  2026-08-28 실측 기준: `pyproject.toml` · `requirements.txt` · `requirements-dev.txt` ·
+  `setup.cfg` · `pytest.ini` · `mypy.ini` · `ruff.toml` · `.ruff.toml` · `conftest.py` ·
+  `tests/conftest.py` · `.gitignore` · `AGENTS.md` · `.env.example` · **`PRD.md`**.
   에이전트가 건드리면 즉시 죽는다. **의존성 추가는 사람이 미리 해야 한다.**
+  - **없는 파일도 목록에 있다** — `ruff.toml` 을 **새로 만들어** 게이트를 느슨하게 하는
+    경로를 막으려고 "(없음)" 도 지문에 넣는다.
+  - **`.env` 자체는 목록에 없다.** `.env.example` 만 있다 — 이 문서가 예전에 `.env*` 로
+    적었던 것은 틀렸다.
+  - **`PRD.md` 는 2026-08-28 에 추가됐다.** 그 전까지 요구사항 정본이 감시 밖이었다 —
+    `design.md:9` 가 "가장 먼저 읽는다", `judge.md:65` 가 "설계의 FR 인용을 PRD 원문과
+    대조한다"로 쓰는 기준선인데도. 수용 기준을 느슨하게 고친 뒤 "PRD 와 일치한다"고
+    판정하는 경로가 열려 있었다. **실제로 일어난 적은 없다** — PRD 개정 2건(v1.1.1·v1.1.2)은
+    전부 사람이 C-15·C-16 으로 근거를 남기고 고친 것이다.
+- **지문 기준선의 위치가 곧 검사 범위다.** 이 스크립트는 순차 실행이라 `PROTECTED_BASELINE`
+  이 찍히는 시점 **이전**의 변경은 기준선에 흡수돼 영원히 안 잡힌다. 2026-08-28 이전에는
+  이 블록이 design·judge **뒤에** 있어서 두 단계가 통째로 검사 밖이었다 — PRD 를 가장 많이
+  읽는 단계들이 그랬다. 지금은 `preflight` 직후(`orchestrate.sh:820`)로 올라갔고 네 단계
+  전부가 검사를 받는다: `check_protected design`(843) · `judge`(859) · `impl`(889) · `verify`(896).
+  **이 블록을 어떤 `run_stage` 아래로 내리지 마라** — 내리는 순간 그 위 단계가 조용히
+  검사 밖이 된다. 죽는 게 아니라 통과하는 종류의 회귀라 테스트로 안 잡힌다.
 - **세션 중 생긴 파일의 이벤트는 계속 `created` 로 찍힌다.** `debounce.py:41` 이 "known_paths 에
   없는 경로의 변경은 신규 편입이라 created 로 승격한다 (FR-017)" 라고 의도를 명시했다. baseline
   기준으로는 계속 신규가 맞고 최종 status 도 `added` 로 정확하다. **2단계 diff 엔진이
@@ -571,12 +661,36 @@ impl 이 주석 한 줄을 두 주행 내내 못 고친 것이 그 증거다.
 - **CRLF↔LF 만 바뀐 파일은 `modified` 인데 diff 본문이 비고 ±0 이다.** 해시는 다르고
   (스냅샷이 바이트 원본) 본문은 정규화되기 때문이다 — 모순이 아니라 설계 5.2 의 의도다.
 - **`errors.jsonl` 을 실제로 쓰는 첫 코드가 diff 실패 기록이다.** 그 전까지는 경로만 있었다.
-- **`--allow-secrets` 는 이미 파싱돼 `WatchConfig` 까지 온다** (`cli.py:86,113`). 3단계는
-  옵션을 만드는 게 아니라 **읽는 코드를 붙이는 것**이다.
+- ✅ **`--allow-secrets` 는 이제 실제로 읽힌다** — `cli.py:113` → `WatchConfig` →
+  `watcher.py:323` → `redact_diff`. 3단계가 배선을 끝냈다.
 - **테스트 헬퍼가 구현과 같은 논리를 쓰면 게이트가 눈을 감는다** — 5절 (마) 가 실제 사례다.
-- **`session.json` 의 `watch_root` 는 절대 경로 + Windows 사용자명이다.** diff 산출물은
-  깨끗한데 여기만 남아 있다 (2026-08-28 실측). 로컬에는 그대로 두는 게 맞지만
-  **프롬프트·전송 경로에 실으면 FR-037 위반이다** — 3단계가 다뤄야 한다.
+- **`session.json` 의 `watch_root` 는 여전히 절대 경로 + Windows 사용자명이다**
+  (`session.py:120`, 2026-08-28 실측). **3단계가 이걸 고치지 않았고, 고치는 게 맞다** —
+  PRD C-11 이 "로컬에는 실제 경로 저장, 해싱·제거는 외부 프롬프트에 넣을 때만"으로 정했다.
+  **지뢰는 4단계로 이월된다**: 3단계 방어선은 diff 본문·경로에만 쳐져 있어서,
+  4단계가 세션 메타데이터를 프롬프트에 실으면 거기서 사용자명이 샌다 (FR-037 위반).
+- **정제된 diff 는 디스크에 없다.** `RedactionResult.text` 는 메모리에만 있다가
+  `run_session` 이 끝나면 사라지고, `WatchOutcome` 이 나르는 것은 `secrets_blocked: bool`
+  하나다 (`watcher.py:79`). `final.diff` 는 **원본 그대로**이고 `redaction.json` 에도 본문이
+  없다. **4단계는 정제본을 넘겨받는 게 아니라 다시 만들어야 한다** — 5절 (나) 판정 1번.
+- **`redaction.json` 은 diff 가 만들어진 세션에서만 생긴다.** `no_change` 세션은 정제
+  단계에 들어가지도 않고, diff 생성이 실패한 세션도 마찬가지다 (`watcher.py:456-460`).
+  없다고 오류가 아니다 — `final.diff`·`stats.json` 과 같은 규칙이다.
+- **탐지 원문은 어디에도 안 남는다.** `SecretFinding` 이 `(rule_id, rel_path, line_no)`
+  세 필드뿐이라 매치 문자열을 담을 자리가 없다 (`redact.py:87`). 유출 방지 산출물이
+  유출 경로가 되는 것을 자료구조로 막은 것이다 — **디버깅하겠다고 원문 필드를 늘리지 마라.**
+- **종료 코드 1 이 이제 두 가지 뜻이다.** 탐지-중단은 `status: failed` +
+  `error: "secrets_detected"`, 과도기는 `status: partial` +
+  `error: "summary_pipeline_not_implemented"` 다 (`watcher.py:509,512`).
+  **6단계 E2E 는 종료 코드가 아니라 `status`+`error` 쌍으로 판별해야 한다.**
+- **경로는 스캔하지만 마스킹하지 않는다.** `config/prod-key.pem` 같은 파일명은 탐지에
+  잡혀 전송을 막지만, `--allow-secrets` 로 진행할 때 경로 자체는 가리지 않는다 —
+  "경로를 가리면 요약이 무슨 파일인지 말할 수 없다" (`redact.py:296`).
+- **`Path()` 를 쓴 테스트는 실행 OS 에 묶인다.** macOS 에서 `Path("Z:/x").drive` 는 빈
+  문자열이라 `watchmode` 의 드라이브 분기가 통째로 건너뛰어진다. Windows 경로 픽스처는
+  `PureWindowsPath` 로 명시 파싱해야 어디서든 같은 분기를 탄다 (`tests/test_watchmode.py:13`).
+  **더 나쁜 쪽은 실패가 아니라 조용한 통과였다** — `test_local_drive_stays_native` 가
+  판정 함수를 한 번도 안 부르고 기대값만 우연히 맞았다.
 - 판정 함수(`run_preflight` 등)에는 `print` 가 없다. 콘솔 출력은 `main` 에서만 한다.
 - verify 는 `tests/test_*.py` 만 수정할 수 있다 (`prompts/verify.md:62`). **소스의 린트·타입 오류는 impl 만 고칠 수 있다.**
 - 0단계 JUDGE 미확인 2건(Windows `os.replace` 원자성, `token_hex(2)`)은 147개 테스트가
@@ -602,12 +716,17 @@ git clone https://github.com/pro047/class-code-watcher.git
 cd class-code-watcher
 py -3.14 -m venv .venv                    # 3.11 이상이면 됨
 .venv\Scripts\python -m pip install -e ".[dev]"
-.venv\Scripts\python -m pytest -q       # 147 passed 나와야 정상
+.venv\Scripts\python -m pytest -q       # 192 passed 나와야 정상
 ```
 
-`.env` 도 커밋되지 않는다. 1~3단계는 외부 호출이 없어 없어도 되고, 4단계(LLM)부터
-`.env.example` 을 복사해 채워야 한다. **3단계 정제도 외부 호출은 없다** — 전송 직전에
-로컬에서 도는 스캐너다.
+macOS·리눅스에서는 `python3 -m venv .venv && .venv/bin/python -m pip install -e ".[dev]"`
+로 같은 결과가 나온다 — **2026-08-28 macOS / Python 3.12.11 에서 192 passed 실측**.
+게이트 3종은 OS 를 안 탄다.
+
+`.env` 도 커밋되지 않는다. 1~3단계는 외부 호출이 없어 없어도 되고, **4단계(LLM)부터
+`.env.example` 을 복사해 실제 `OPENAI_API_KEY` 를 채워야 한다.** 3단계 정제도 외부 호출은
+없다 — 전송 직전에 로컬에서 도는 스캐너다. 다만 3단계가 `.env` 의 실값을 `known_secret`
+백스톱 규칙으로 쓰므로, **`.env` 가 있으면 스캐너가 한 겹 더 두꺼워진다** (`redact.py:130`).
 
 **파이프라인은 bash 가 필요하다.** PowerShell 에서는 이렇게 부른다:
 
@@ -616,9 +735,12 @@ py -3.14 -m venv .venv                    # 3.11 이상이면 됨
 & "C:\Program Files\Git\bin\bash.exe" ./approve.sh <feature> DESIGN.md
 ```
 
-`.pipeline/` 도 커밋되지 않는다. 1·2단계 산출물(`.pipeline/watch-engine/`,
-`.pipeline/diff-engine/`)과 승인 마커는 돌린 PC 에만 있다 — **3단계는 새 feature 이므로
-문제되지 않는다.** 자세한 것은 2.1 절.
+`.pipeline/` 도 커밋되지 않는다. 1·2·3단계 산출물(`.pipeline/watch-engine/`,
+`.pipeline/diff-engine/`, `.pipeline/redactor/`)과 승인 마커는 돌린 PC 에만 있다 —
+**4단계는 새 feature(`summarizer`) 이므로 문제되지 않는다.** 자세한 것은 2.1 절.
+
+**3단계 주행 실적이 이 리포에 없는 이유가 이것이다** (3절). 그 PC 에 돌아가면
+`jq -r '.total_cost_usd' .pipeline/redactor/*.result.json` 로 뽑아 3절 표를 채워라.
 
 ### 그 밖의 환경 사실
 
@@ -630,4 +752,5 @@ py -3.14 -m venv .venv                    # 3.11 이상이면 됨
   남기지 말고 exe 와 함께 USB 에 둔다 (FR-054)
 - 모델 배치: design·judge·verify = `claude-fable-5`, impl = `claude-opus-5`
 - 예산 실적: 0단계 impl $1.3~5.2 / verify $4.8. 1단계 judge $5.6 / impl $2.5 / verify $3.9.
-  2단계 design $2.9 / judge $5.5 / impl $2.3 / verify $5.6 — **한 바퀴 $16.4**
+  2단계 design $2.9 / judge $5.5 / impl $2.3 / verify $5.6 — **한 바퀴 $16.4**.
+  **3단계는 미기재** — 다른 PC 에서 돌아 `.pipeline/redactor/` 가 여기 없다 (3절)

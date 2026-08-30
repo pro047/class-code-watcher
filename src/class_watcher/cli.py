@@ -28,6 +28,7 @@ from .config import (
     mask_secrets,
     merge_env,
 )
+from .openai_client import DEFAULT_OPENAI_MODEL, resolve_model
 from .selector import Selection, scan_files
 from .session import (
     SessionPaths,
@@ -39,7 +40,13 @@ from .session import (
     transition,
     write_session_json,
 )
-from .watcher import run_session
+from .watcher import (
+    SUMMARY_DRY_RUN,
+    SUMMARY_FAILED,
+    SUMMARY_FALLBACK,
+    SUMMARY_NOT_RUN,
+    run_session,
+)
 
 # PRD 10.3 의 4종.
 EXIT_OK = 0
@@ -157,7 +164,12 @@ def bootstrap(
     return preflight, paths
 
 
-def run_watch(preflight: Preflight, paths: SessionPaths, secrets: Secrets) -> int:
+def run_watch(
+    preflight: Preflight,
+    paths: SessionPaths,
+    secrets: Secrets,
+    model: str = DEFAULT_OPENAI_MODEL,
+) -> int:
     """감시 세션을 돌리고 결과를 종료 코드로 환원한다 (PRD 10.3).
 
     세션 상태 기록은 watcher 쪽이 이미 끝낸다. 여기서는 코드 매핑과 콘솔 마무리만 한다.
@@ -169,6 +181,7 @@ def run_watch(preflight: Preflight, paths: SessionPaths, secrets: Secrets) -> in
             preflight.selection,
             lambda message: _emit(message, secrets),
             secrets,
+            model,
         )
     except OSError as exc:
         _record_failure(paths, "watch_io_error")
@@ -195,7 +208,26 @@ def run_watch(preflight: Preflight, paths: SessionPaths, secrets: Secrets) -> in
         _emit_error("       탐지 위치는 redaction.json 을 확인하세요.", secrets)
         _emit_error(f"       세션 산출물은 보존됩니다: {paths.root}", secrets)
         return EXIT_RUNTIME
-    _emit_error("[FAILED] 요약·전송 단계는 아직 구현되지 않았습니다.", secrets)
+    if outcome.summary_state == SUMMARY_DRY_RUN:
+        # PRD 10.2: dry-run 은 프롬프트까지 검증하면 할 일이 끝난 것이다.
+        _emit(f"[DONE] dry-run 으로 프롬프트까지 검증했습니다: {paths.root}", secrets)
+        return EXIT_OK
+    if outcome.summary_state == SUMMARY_NOT_RUN:
+        _emit_error("[FAILED] 요약 단계까지 진행하지 못했습니다.", secrets)
+        _emit_error("       원인은 session.json 의 error 와 errors.jsonl 을 확인하세요.", secrets)
+        _emit_error(f"       세션 산출물은 보존됩니다: {paths.root}", secrets)
+        return EXIT_RUNTIME
+    if outcome.summary_state == SUMMARY_FAILED:
+        _emit_error("[FAILED] 요약을 만들지 못했습니다.", secrets)
+        _emit_error("       원인은 session.json 의 error 를 확인하세요.", secrets)
+        _emit_error(f"       세션 산출물은 보존됩니다: {paths.root}", secrets)
+        return EXIT_RUNTIME
+    if outcome.summary_state == SUMMARY_FALLBACK:
+        _emit("[WARN] 모델 요약 대신 규칙 기반 요약을 저장했습니다.", secrets)
+    if preflight.config.no_discord:
+        _emit(f"[DONE] 요약까지 완료했습니다. 전송은 생략합니다: {paths.root}", secrets)
+        return EXIT_OK
+    _emit_error("[FAILED] Discord 전송 단계는 아직 구현되지 않았습니다.", secrets)
     _emit_error(f"       세션 산출물은 보존됩니다: {paths.root}", secrets)
     return EXIT_RUNTIME
 
@@ -243,7 +275,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # 종료 코드를 값으로 받도록 여기서 환원한다.
         return EXIT_OK if exc.code in (0, None) else EXIT_CONFIG
 
-    secrets = load_secrets(_load_env_mapping())
+    env = _load_env_mapping()
+    secrets = load_secrets(env)
+    # 모델명은 비밀값이 아니라 설정값이라 Secrets 에 넣지 않는다. 병합된 env 를 읽는 것은
+    # 여기 한 곳뿐이고, 아래 계층으로는 확정된 이름만 내려간다.
+    model = resolve_model(env)
 
     try:
         now = datetime.now().astimezone()
@@ -275,7 +311,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _emit("[WARN] 감시 대상 파일이 없습니다. --include 패턴이나 DIR 을 확인하세요.", secrets)
 
     try:
-        return run_watch(preflight, paths, secrets)
+        return run_watch(preflight, paths, secrets, model)
     except KeyboardInterrupt:
         _emit_error("[ABORTED] 사용자가 종료했습니다.", secrets)
         return EXIT_ABORTED

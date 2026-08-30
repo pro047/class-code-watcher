@@ -11,7 +11,7 @@ import os
 import queue
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
@@ -26,6 +26,7 @@ from .config import (
     FINALIZE_ENTER_BUDGET_MS,
     Secrets,
     WatchConfig,
+    mask_secrets,
 )
 from .debounce import Debouncer, EventKind, LogicalEvent, RawEvent
 from .diffgen import (
@@ -36,6 +37,7 @@ from .diffgen import (
     watched_file_entries,
 )
 from .eventlog import append_jsonl, event_row
+from .openai_client import DEFAULT_OPENAI_MODEL, make_openai_caller
 from .redact import (
     ERROR_SECRETS_DETECTED,
     RedactionResult,
@@ -51,6 +53,19 @@ from .selector import Selection, is_watched
 from .session import SessionPaths, SessionStatus, transition, write_session_json
 from .snapshot import SnapshotResult, hash_bytes, hash_map, snapshot_tree, write_manifest
 from .stability import wait_for_stability
+from .summarize import (
+    SOURCE_RULE_BASED,
+    PromptInput,
+    SummarizeOutcome,
+    build_prompt,
+    prompt_doc,
+    prompt_file_stats,
+    run_summarize,
+    schema_error_row,
+    session_openai_fields,
+    write_prompt_json,
+    write_summary_json,
+)
 from .watchmode import DRIVE_REMOTE, resolve_watch_mode
 
 # Ctrl+C 반응 지연의 상한. 큐 대기가 이보다 길면 인터럽트가 늦게 전달될 수 있다.
@@ -63,9 +78,24 @@ STATUS_DELETED = "deleted"
 # 중단된 세션 전용. baseline↔final 비교를 못 했으므로 어느 상태도 주장하지 않는다.
 STATUS_UNKNOWN = "unknown"
 
-# 변경이 있는 세션의 종료 사유 — 요약·전송 단계가 아직 없다.
-PENDING_PIPELINE_ERROR = "summary_pipeline_not_implemented"
+# 요약까지 끝났지만 Discord 전송(5단계)이 아직 없는 세션의 종료 사유. 5단계가 이 자리를 가져간다.
+ERROR_DISCORD_PENDING = "discord_pipeline_not_implemented"
+# diff 를 못 만들어 정제·요약에 넘길 것이 없는 세션.
+ERROR_DIFF_FAILED = "diff_failed"
+# 정제 산출물을 못 써서 스캔 통과를 주장할 수 없는 세션.
+ERROR_REDACTION_FAILED = "redaction_failed"
+ERROR_OPENAI_KEY_MISSING = "openai_key_missing"
+# 요약 자체는 만들었지만 산출물을 못 쓴 세션. 성공으로 부르면 5단계가 없는 파일을 읽는다.
+ERROR_SUMMARY_WRITE_FAILED = "summary_write_failed"
 ABORTED_ERROR = "aborted_by_user"
+
+# WatchOutcome.summary_state — cli 의 콘솔·종료 코드 매핑 기준.
+SUMMARY_OK = "ok"
+SUMMARY_FALLBACK = "fallback"
+SUMMARY_FAILED = "failed"
+SUMMARY_DRY_RUN = "dry_run"
+# 요약 단계에 도달하지 못한 세션 (no_change·차단·diff/정제 실패·abort).
+SUMMARY_NOT_RUN = "not_run"
 
 
 @dataclass(frozen=True)
@@ -77,6 +107,7 @@ class WatchOutcome:
     aborted: bool
     # 비밀값 탐지로 외부 전송을 중단한 세션 (FR-036). 종료 코드는 1 그대로다.
     secrets_blocked: bool = False
+    summary_state: str = SUMMARY_NOT_RUN
 
 
 def compute_statuses(
@@ -109,6 +140,58 @@ def unknown_file_statuses(selected: Sequence[PurePosixPath]) -> list[dict[str, s
 
 def is_no_change(statuses: Mapping[str, str]) -> bool:
     return all(status == STATUS_UNCHANGED for status in statuses.values())
+
+
+def resolve_summary_state(
+    outcome: SummarizeOutcome | None, *, attempted: bool, dry_run: bool
+) -> str:
+    """순수 — 요약 결과를 WatchOutcome.summary_state 로 환원한다.
+
+    attempted 는 "정제를 통과해 요약 지점까지 왔는가"다. dry-run 은 호출을 하지 않고도
+    할 일을 다 한 경우라 실패와 구분해야 한다 (PRD 10.2).
+    """
+    if not attempted:
+        return SUMMARY_NOT_RUN
+    if outcome is None:
+        return SUMMARY_DRY_RUN if dry_run else SUMMARY_NOT_RUN
+    if outcome.error is not None:
+        return SUMMARY_FAILED
+    if outcome.source == SOURCE_RULE_BASED:
+        return SUMMARY_FALLBACK
+    return SUMMARY_OK
+
+
+def resolve_session_end(
+    *,
+    no_change: bool,
+    secrets_blocked: bool,
+    diff_failed: bool,
+    redaction_failed: bool,
+    summary_state: str,
+    summary_error: str | None,
+    no_discord: bool,
+) -> tuple[SessionStatus, str | None]:
+    """순수 — 세션 종료 status·error 판정 (PRD 12절 표).
+
+    분기 순서가 곧 우선순위다. 비밀값 차단이 맨 앞인 이유는 그 뒤 어떤 단계가 실패했든
+    사용자에게 알려야 하는 사실이 "전송을 막았다"이기 때문이다.
+    """
+    if no_change:
+        return SessionStatus.COMPLETED, None
+    if secrets_blocked:
+        return SessionStatus.FAILED, ERROR_SECRETS_DETECTED
+    if diff_failed:
+        return SessionStatus.PARTIAL, ERROR_DIFF_FAILED
+    if redaction_failed:
+        return SessionStatus.PARTIAL, ERROR_REDACTION_FAILED
+    if summary_state == SUMMARY_DRY_RUN:
+        return SessionStatus.COMPLETED, None
+    if summary_error is not None:
+        return SessionStatus.PARTIAL, summary_error
+    if summary_state in (SUMMARY_OK, SUMMARY_FALLBACK) and no_discord:
+        # 사용자가 전송 생략을 명시했으므로 이 설정에서 할 일이 전부 끝났다 (PRD 10.2).
+        return SessionStatus.COMPLETED, None
+    return SessionStatus.PARTIAL, ERROR_DISCORD_PENDING
 
 
 def _drive_type_of(drive_root: str) -> int:
@@ -201,6 +284,7 @@ class _Session:
         selection: Selection,
         emit: Callable[[str], None],
         secrets: Secrets,
+        model: str,
     ) -> None:
         self.config = config
         self.paths = paths
@@ -208,6 +292,8 @@ class _Session:
         self.emit = emit
         # known-value 탐지 규칙에만 쓴다 (FR-036). 다른 용도로 쓰지 않는다.
         self.secrets = secrets
+        # 비밀값이 아니라 설정값이다. 해석은 cli 가 끝내고 여기로는 확정된 이름만 온다.
+        self.model = model
         self.doc: dict[str, object] = {}
         self.baseline_hashes: dict[str, str] = {}
         self.observed: set[str] = set()
@@ -280,14 +366,7 @@ def _generate_diff(
             ended_at=ended_at,
         )
     except OSError as exc:
-        append_jsonl(
-            state.paths.errors_jsonl,
-            {
-                "timestamp": datetime.now().astimezone().isoformat(),
-                "stage": "diff",
-                "error": type(exc).__name__,
-            },
-        )
+        _stage_error(state, "diff", exc)
         state.emit("[WARN] diff 생성에 실패했습니다. baseline/final 스냅샷은 그대로 남습니다.")
         return None
     state.emit(_diff_console_line(result))
@@ -332,18 +411,131 @@ def _run_redaction(state: "_Session", diff_result: DiffResult) -> RedactionResul
     try:
         write_redaction_json(state.paths.redaction_json, doc)
     except OSError as exc:
-        append_jsonl(
-            state.paths.errors_jsonl,
-            {
-                "timestamp": datetime.now().astimezone().isoformat(),
-                "stage": "redaction",
-                "error": type(exc).__name__,
-            },
-        )
+        _stage_error(state, "redaction", exc)
         state.emit("[WARN] 비밀정보 검사 결과를 저장하지 못했습니다. 외부 전송은 하지 않습니다.")
         return None
     state.emit(_scan_console_line(result))
     return result
+
+
+def _stage_error(state: "_Session", stage: str, exc: OSError) -> None:
+    """errors.jsonl 한 행. 예외 메시지 원문은 싣지 않는다 — 경로·환경이 새는 통로다 (FR-042)."""
+    append_jsonl(
+        state.paths.errors_jsonl,
+        {
+            "timestamp": datetime.now().astimezone().isoformat(),
+            "stage": stage,
+            "error": type(exc).__name__,
+        },
+    )
+
+
+def _record_schema_failures(state: "_Session", outcome: SummarizeOutcome) -> None:
+    """검증 실패 원본의 "제한적 보관" (FR-031, PRD 9.3).
+
+    발췌를 mask_secrets 에 통과시키는 것이 여기다 — 응답에 키가 되비쳐 나와도
+    errors.jsonl 에는 남지 않는다 (FR-042).
+    """
+    for failure in outcome.schema_failures:
+        masked = replace(
+            failure, raw_excerpt=mask_secrets(failure.raw_excerpt, state.secrets)
+        )
+        append_jsonl(
+            state.paths.errors_jsonl,
+            schema_error_row(masked, timestamp=datetime.now().astimezone().isoformat()),
+        )
+
+
+def _flag_llm_sensitive(state: "_Session") -> None:
+    """모델의 sensitive_data_detected 를 redaction.json 에 사후 신호로 더한다 (PRD 11.3).
+
+    전송 차단이 아니다 — 스캐너 규칙 개선 후보를 모으는 기록일 뿐이라는 PRD 원칙 그대로다.
+    """
+    state.emit("[WARN] 모델이 비밀정보 의심을 신고했습니다. redaction.json 을 확인하세요.")
+    try:
+        doc = json.loads(state.paths.redaction_json.read_text(encoding="utf-8"))
+        doc["llm_sensitive_flag"] = True
+        write_redaction_json(state.paths.redaction_json, doc)
+    except (OSError, ValueError):
+        state.emit("[WARN] redaction.json 에 모델 신고를 기록하지 못했습니다.")
+
+
+def _failed_summary(error: str) -> SummarizeOutcome:
+    """호출 없이 끝난 실패. calls=0 이 session.json 에 그대로 남는다 (FR-035 준수 근거)."""
+    return SummarizeOutcome(
+        source=None,
+        doc=None,
+        calls=0,
+        retries=0,
+        request_id=None,
+        model=None,
+        error=error,
+        http_status=None,
+        llm_sensitive_flag=False,
+        schema_failures=(),
+    )
+
+
+def _run_summarize(
+    state: "_Session", redacted_diff: str, diff_result: DiffResult, ended_at: str
+) -> SummarizeOutcome | None:
+    """요약 호출 지점 (FR-030~FR-032, FR-039). dry-run 성공일 때만 None 을 돌려준다.
+
+    정제를 통과한 본문만 인자로 받는다 — final.diff 를 다시 읽거나 스캔을 다시 도는 경로를
+    만들지 않는다 (FR-036). watch_root·session.json 은 PromptInput 에 들어갈 자리가 아예
+    없어 프롬프트로 새지 않는다 (FR-037).
+    """
+    inp = PromptInput(
+        title=state.config.title,
+        started_at=str(state.doc.get("started_at", "")),
+        ended_at=ended_at,
+        files=prompt_file_stats(diff_result),
+        redacted_diff=redacted_diff,
+    )
+
+    if state.config.dry_run:
+        prompt = build_prompt(inp)
+        target = state.paths.prompt_json
+        doc = prompt_doc(
+            prompt,
+            generated_at=datetime.now().astimezone().isoformat(),
+            model=state.model,
+        )
+        try:
+            write_prompt_json(target, doc)
+        except OSError as exc:
+            _stage_error(state, "summarize", exc)
+            state.emit("[WARN] 프롬프트 산출물을 저장하지 못했습니다.")
+            return _failed_summary(ERROR_SUMMARY_WRITE_FAILED)
+        state.emit(f"[DRY-RUN] 외부 호출 없이 프롬프트까지 검증했습니다: {target}")
+        return None
+
+    api_key = state.secrets.openai_api_key
+    if not api_key:
+        state.emit("[FAILED] OPENAI_API_KEY 가 없습니다. .env 를 확인하세요.")
+        return _failed_summary(ERROR_OPENAI_KEY_MISSING)
+
+    outcome = run_summarize(
+        inp,
+        make_openai_caller(api_key, state.model),
+        now=lambda: datetime.now().astimezone().isoformat(),
+        emit=state.emit,
+    )
+    _record_schema_failures(state, outcome)
+    if outcome.llm_sensitive_flag:
+        _flag_llm_sensitive(state)
+    if outcome.doc is None:
+        return outcome
+
+    target = state.paths.summary_json
+    try:
+        write_summary_json(target, outcome.doc)
+    except OSError as exc:
+        _stage_error(state, "summarize", exc)
+        state.emit("[WARN] 요약 산출물을 저장하지 못했습니다.")
+        return replace(outcome, error=ERROR_SUMMARY_WRITE_FAILED)
+    state.emit(f"[AI] 요약 저장: {target}")
+    return outcome
 
 
 def _drain_queue(sink: "queue.Queue[RawEvent]", debouncer: Debouncer) -> None:
@@ -367,9 +559,14 @@ def run_session(
     selection: Selection,
     emit: Callable[[str], None],
     secrets: Secrets,
+    model: str = DEFAULT_OPENAI_MODEL,
 ) -> WatchOutcome:
-    """감시 세션 전체. session.json 의 상태 전이도 여기서 밟는다 (FR-040)."""
-    state = _Session(config, paths, selection, emit, secrets)
+    """감시 세션 전체. session.json 의 상태 전이도 여기서 밟는다 (FR-040).
+
+    model 은 `.env` 병합까지 끝낸 cli 가 넘긴다. 기본값을 둔 것은 이 함수를 직접 부르는
+    호출부가 env 해석을 몰라도 되게 하기 위해서다.
+    """
+    state = _Session(config, paths, selection, emit, secrets, model)
     state.doc = json.loads(paths.session_json.read_text(encoding="utf-8"))
 
     decision = resolve_watch_mode(config.watch_root, config.polling, os.environ, _drive_type_of)
@@ -421,6 +618,8 @@ def _finalize(
     statuses: dict[str, str] = {}
     diff_result: DiffResult | None = None
     redaction: RedactionResult | None = None
+    summarize: SummarizeOutcome | None = None
+    summarize_attempted = False
     # stats.json 과 session.json 이 서로 다른 시각을 말하면 같은 세션으로 안 보인다.
     ended_at: str | None = None
     try:
@@ -458,6 +657,13 @@ def _finalize(
             # diff 를 못 만든 세션은 스캔할 대상 자체가 없다.
             if diff_result is not None:
                 redaction = _run_redaction(state, diff_result)
+                # blocked 면 text 가 None 이라 요약 인자를 만들 수 없다 — 타입과 가드 이중으로
+                # 무호출을 보장한다 (FR-036). 요약은 정제 판정 직후, 이 try 안에 둔다.
+                if redaction is not None and redaction.text is not None:
+                    summarize_attempted = True
+                    summarize = _run_summarize(
+                        state, redaction.text, diff_result, ended_at
+                    )
     except KeyboardInterrupt:
         aborted = True
 
@@ -498,18 +704,31 @@ def _finalize(
         "watched_files": watched_files,
         "change_stats": change_stats,
         "no_change": no_change,
+        # 호출이 없던 세션도 calls: 0 으로 남긴다 — "호출 0회"를 사후에 증명할 수 있어야
+        # 준수율 집계(PRD 15절)가 전 세션에서 성립한다 (FR-030, FR-035).
+        "openai": session_openai_fields(summarize),
     }
+    if state.config.dry_run:
+        fields["dry_run"] = True
     if redaction is not None:
         fields["redaction"] = session_redaction_fields(redaction)
     secrets_blocked = redaction is not None and redaction.blocked
-    if no_change:
-        state.write_status(SessionStatus.COMPLETED, **fields)
-    elif secrets_blocked:
-        # 탐지-중단은 PRD 12절 표의 failed 다. 종료 코드 1 의 세부 원인은 error 가 구분한다.
-        state.write_status(SessionStatus.FAILED, **fields, error=ERROR_SECRETS_DETECTED)
+    summary_state = resolve_summary_state(
+        summarize, attempted=summarize_attempted, dry_run=state.config.dry_run
+    )
+    status, error = resolve_session_end(
+        no_change=no_change,
+        secrets_blocked=secrets_blocked,
+        diff_failed=not no_change and diff_result is None,
+        redaction_failed=diff_result is not None and redaction is None,
+        summary_state=summary_state,
+        summary_error=summarize.error if summarize is not None else None,
+        no_discord=state.config.no_discord,
+    )
+    if error is None:
+        state.write_status(status, **fields)
     else:
-        # 요약~전송(2~5단계)이 아직 없어 세션을 완료로 부를 수 없다 (PRD 10.3 코드 1).
-        state.write_status(SessionStatus.PARTIAL, **fields, error=PENDING_PIPELINE_ERROR)
+        state.write_status(status, **fields, error=error)
 
     return WatchOutcome(
         statuses=statuses,
@@ -518,6 +737,7 @@ def _finalize(
         no_change=no_change,
         aborted=False,
         secrets_blocked=secrets_blocked,
+        summary_state=summary_state,
     )
 
 
@@ -534,5 +754,7 @@ __all__ = [
     "WatchOutcome",
     "compute_statuses",
     "is_no_change",
+    "resolve_session_end",
+    "resolve_summary_state",
     "run_session",
 ]

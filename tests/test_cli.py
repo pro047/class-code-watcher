@@ -267,16 +267,18 @@ def test_main_changed_session_ends_partial(
 
     _interrupt_after(monkeypatch, [change])
     rc = cli.main(["watch", str(tree), "--session-dir", str(sessions)])
-    # 변경 있음 → 후속 파이프라인 미구현 → partial / 코드 1 (설계 4절 과도기 매핑).
+    # 변경 있음 + 키 없음(isolated_env) → 요약 실패 → partial / 코드 1 (설계 6.6 매핑).
     assert rc == cli.EXIT_RUNTIME
 
     [root] = list(sessions.iterdir())
     doc = json.loads((root / "session.json").read_text(encoding="utf-8"))
     assert doc["status"] == "partial"
-    assert doc["error"] == "summary_pipeline_not_implemented"
+    assert doc["error"] == "openai_key_missing"
+    assert doc["openai"] == {"calls": 0, "retries": 0, "model": None, "request_id": None}
 
     captured = capsys.readouterr()
-    assert "[FAILED] 요약·전송 단계는 아직 구현되지 않았습니다." in captured.err
+    assert "[FAILED] 요약을 만들지 못했습니다." in captured.err
+    captured.err.encode("cp949")
 
 
 def test_main_secret_session_blocks_without_network(
@@ -332,7 +334,8 @@ def test_main_allow_secrets_masks_and_continues(
     [root] = list(sessions.iterdir())
     doc = json.loads((root / "session.json").read_text(encoding="utf-8"))
     assert doc["status"] == "partial"
-    assert doc["error"] == "summary_pipeline_not_implemented"
+    # 마스킹 후 요약 지점까지 진행했고, 키가 없으므로(isolated_env) 거기서 멈춘다.
+    assert doc["error"] == "openai_key_missing"
     redaction = json.loads((root / "redaction.json").read_text(encoding="utf-8"))
     assert redaction["policy"] == "mask"
     assert redaction["allow_secrets"] is True
@@ -437,14 +440,26 @@ def test_full_run_never_touches_network(
     capsys.readouterr()
 
 
-def test_package_has_no_network_client_imports() -> None:
-    """구조적 보장: openai·httpx 등 네트워크 클라이언트를 import 하는 모듈이 없다."""
+def test_network_client_imports_only_in_designated_adapter() -> None:
+    """구조적 보장: 네트워크 클라이언트 import 는 어댑터(openai_client.py) 한 곳뿐이다.
+
+    설계 3.3 이 외부 API 표면을 openai_client.py 하나에 격리했다. 다른 모듈이 SDK 를
+    직접 import 하기 시작하면 FR-030 의 호출 계수가 mock 경계(CallFn) 밖으로 샌다.
+    """
     package_dir = Path(cli.__file__).resolve().parent
     banned = ("openai", "httpx", "requests", "aiohttp", "urllib", "socket", "http")
+    adapter = "openai_client.py"
     for module_path in sorted(package_dir.glob("*.py")):
+        if module_path.name == adapter:
+            continue
         source = module_path.read_text(encoding="utf-8")
         for name in banned:
             assert f"import {name}" not in source, f"{module_path.name} 이 {name} 을 import 한다"
             assert f"from {name} import" not in source, (
                 f"{module_path.name} 이 {name} 을 import 한다"
             )
+    # 어댑터 자신은 openai 만 쓴다 — httpx 등 다른 클라이언트를 늘리지 않는다.
+    adapter_source = (package_dir / adapter).read_text(encoding="utf-8")
+    assert "from openai import" in adapter_source
+    for name in ("httpx", "requests", "aiohttp", "socket"):
+        assert f"import {name}" not in adapter_source

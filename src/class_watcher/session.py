@@ -53,6 +53,10 @@ class SessionPaths:
     stats_json: Path
     # diff 가 만들어진 세션에서만 생긴다 — 정제 단계는 diff 직후에만 돈다 (FR-036).
     redaction_json: Path
+    # 정제를 통과한 세션에서만 생긴다 — 요약 단계는 차단되지 않은 diff 에만 돈다 (FR-030).
+    summary_json: Path
+    # `--dry-run` 세션에서만 생긴다. 외부 호출 없이 프롬프트까지 검증한 증거다 (PRD 10.2).
+    prompt_json: Path
     # `--history` 일 때만 실제로 만들어진다 (PRD 9.1).
     history_dir: Path
 
@@ -69,6 +73,8 @@ def make_session_paths(session_dir: Path, session_id: str) -> SessionPaths:
         final_diff=root / "final.diff",
         stats_json=root / "stats.json",
         redaction_json=root / "redaction.json",
+        summary_json=root / "summary.json",
+        prompt_json=root / "prompt.json",
         history_dir=root / "history",
     )
 

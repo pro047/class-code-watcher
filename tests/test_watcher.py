@@ -19,23 +19,41 @@ from watchdog.events import (
     FileMovedEvent,
 )
 
-from class_watcher import cli, snapshot, watcher
+from class_watcher import cli, snapshot, summarize, watcher
 from class_watcher.config import DEFAULT_EXCLUDE, Secrets, WatchConfig
 from class_watcher.debounce import Debouncer, RawEvent
 from class_watcher.selector import Selection, is_watched, scan_files
 from class_watcher.session import (
     SessionPaths,
+    SessionStatus,
     create_session_dirs,
     initial_session_doc,
     make_session_paths,
     write_session_json,
 )
-from class_watcher.watcher import WatchOutcome, compute_statuses, is_no_change, run_session
+from class_watcher.summarize import (
+    KIND_TIMEOUT,
+    BuiltPrompt,
+    LlmRequestError,
+    LlmResponse,
+    SummarizeOutcome,
+)
+from class_watcher.watcher import (
+    WatchOutcome,
+    compute_statuses,
+    is_no_change,
+    resolve_session_end,
+    resolve_summary_state,
+    run_session,
+)
 
 NOW = datetime(2026, 8, 27, 10, 0, 0).astimezone()
 INCLUDE = ("*.py",)
 # run_session 의 5번째 인자 (known-value 탐지 규칙용). 키가 없는 상태가 기본이다.
 NO_SECRETS = Secrets(openai_api_key=None, discord_webhook_url=None)
+# 요약 경로까지 진입시키는 세션용. 실 SDK 는 make_openai_caller 를 갈아끼워 절대 뜨지 않는다.
+FAKE_KEY = "sk-test-abcdef1234567890"
+WITH_KEY = Secrets(openai_api_key=FAKE_KEY, discord_webhook_url=None)
 
 # ── 기준 24: 핸들러가 exclude 경로·allowlist 밖 확장자를 버린다 (FR-011) ──────
 
@@ -176,7 +194,12 @@ def _script_loop(monkeypatch: pytest.MonkeyPatch, steps: list[Step]) -> _DummyOb
 
 
 def _setup_session(
-    tmp_path: Path, *, history: bool = False, allow_secrets: bool = False
+    tmp_path: Path,
+    *,
+    history: bool = False,
+    allow_secrets: bool = False,
+    dry_run: bool = False,
+    no_discord: bool = False,
 ) -> tuple[WatchConfig, SessionPaths, Selection]:
     root = tmp_path / "tree"
     root.mkdir()
@@ -191,8 +214,8 @@ def _setup_session(
         polling=False,
         history=history,
         session_dir=tmp_path / "sessions",
-        dry_run=False,
-        no_discord=False,
+        dry_run=dry_run,
+        no_discord=no_discord,
         allow_secrets=allow_secrets,
     )
     selection = scan_files(root, config.include, config.exclude)
@@ -279,7 +302,9 @@ def test_changed_session_is_partial_and_preserves_artifacts(
 
     doc = _session_doc(paths)
     assert doc["status"] == "partial"
-    assert doc["error"] == watcher.PENDING_PIPELINE_ERROR
+    # 키 없는 세션은 요약 지점에서 호출 없이 실패한다 (4단계 매핑 — 설계 6.6).
+    assert doc["error"] == watcher.ERROR_OPENAI_KEY_MISSING
+    assert doc["openai"] == {"calls": 0, "retries": 0, "model": None, "request_id": None}
     assert doc["no_change"] is False
     assert doc["watched_files"] == [{"path": "a.py", "status": "modified"}]
     # diff 단계가 PRD 9.2 의 4필드를 채운다 (설계 기준 16).
@@ -542,6 +567,7 @@ def test_aborted_outcome_maps_to_130(
         selection_: Selection,
         emit: Callable[[str], None],
         secrets_: Secrets,
+        model_: str,
     ) -> WatchOutcome:
         return WatchOutcome(
             statuses={}, unstable=False, logical_event_count=0, no_change=False, aborted=True
@@ -568,6 +594,7 @@ def test_oserror_during_watch_records_failed(
         selection_: Selection,
         emit: Callable[[str], None],
         secrets_: Secrets,
+        model_: str,
     ) -> WatchOutcome:
         raise OSError("디스크가 사라졌다")
 
@@ -599,6 +626,7 @@ def test_emitted_lines_are_masked_by_cli(
         selection_: Selection,
         emit: Callable[[str], None],
         secrets_: Secrets,
+        model_: str,
     ) -> WatchOutcome:
         emit(f"디버그 출력에 섞인 키: {secret_value}")
         return WatchOutcome(
@@ -731,7 +759,8 @@ def test_allow_secrets_session_masks_and_continues(
     assert outcome.secrets_blocked is False
     doc = _session_doc(paths)
     assert doc["status"] == "partial"
-    assert doc["error"] == watcher.PENDING_PIPELINE_ERROR
+    # 마스킹 후 계속 진행하면 요약 지점에 닿고, 키가 없으므로 거기서 멈춘다 (설계 6.6).
+    assert doc["error"] == watcher.ERROR_OPENAI_KEY_MISSING
     assert doc["redaction"] == {
         "secrets_found": 1,
         "by_rule": {"openai_api_key": 1},
@@ -763,7 +792,8 @@ def test_clean_changed_session_writes_clean_redaction(
     assert outcome.secrets_blocked is False
     doc = _session_doc(paths)
     assert doc["status"] == "partial"
-    assert doc["error"] == watcher.PENDING_PIPELINE_ERROR
+    # 깨끗한 세션도 키가 없으면 요약 지점에서 멈춘다 (설계 6.6).
+    assert doc["error"] == watcher.ERROR_OPENAI_KEY_MISSING
     assert doc["redaction"] == {
         "secrets_found": 0,
         "by_rule": {},
@@ -840,7 +870,9 @@ def test_redaction_write_failure_fails_safe(
     assert outcome.secrets_blocked is False
     doc = _session_doc(paths)
     assert doc["status"] == "partial"
-    assert doc["error"] == watcher.PENDING_PIPELINE_ERROR
+    # 정제 산출물을 못 쓴 세션은 스캔 통과를 주장할 수 없다 — 요약 지점에 진입하지 않는다.
+    assert doc["error"] == watcher.ERROR_REDACTION_FAILED
+    assert doc["openai"] == {"calls": 0, "retries": 0, "model": None, "request_id": None}
     assert "redaction" not in doc
     assert not paths.redaction_json.exists()
     [row] = [
@@ -868,9 +900,469 @@ def test_secrets_blocked_maps_to_exit_runtime(
     assert "[FAILED] 비밀정보 패턴이 탐지되어 외부 전송을 중단했습니다." in captured.err
     assert "redaction.json" in captured.err
     assert "세션 산출물은 보존됩니다" in captured.err
-    # 차단 분기는 기존 과도기 [FAILED] 문구를 내지 않는다.
-    assert "요약·전송 단계는 아직 구현되지 않았습니다" not in captured.err
+    # 차단 분기는 과도기 [FAILED] 문구(Discord 미구현)를 내지 않는다.
+    assert "Discord 전송 단계는 아직 구현되지 않았습니다" not in captured.err
     assert "외부 전송을 중단합니다" in captured.out  # [SCAN] 라인
     # 회귀: 새 콘솔 문자열 전부 cp949 로 인코딩된다 (HANDOFF (다) 결함 재발 방지).
+    captured.out.encode("cp949")
+    captured.err.encode("cp949")
+
+
+# ── 4단계 요약 배선 — 호출 계수·산출물·상태 매핑 (FR-030~032, 035, 037, 039, 042) ──
+#
+# mock 경계는 CallFn 하나다: watcher.make_openai_caller 를 가짜 팩토리로 갈아끼우면
+# 실 SDK·네트워크 없이 전 경로가 돈다 (설계 6.7, IMPL 4.3).
+
+VALID_SUMMARY_TEXT = json.dumps(
+    {
+        "session_title": "검증",
+        "summary": "값을 바꾸는 변경을 했다.",
+        "change_stats": {"files_changed": 1, "added_lines": 1, "deleted_lines": 1},
+        "changes": [
+            {
+                "file": "a.py",
+                "area": "핵심",
+                "type": "modified",
+                "description": "변수 값을 바꾸는 코드",
+                "evidence": "x = 2",
+            }
+        ],
+        "learning_points": [],
+        "questions_to_review": [],
+        "risks_or_todos": [],
+        "sensitive_data_detected": False,
+    },
+    ensure_ascii=False,
+)
+
+
+class _FakeCaller:
+    """make_openai_caller 자리의 가짜 팩토리. 호출 횟수와 프롬프트를 기록한다."""
+
+    def __init__(self, outcomes: list[str | LlmRequestError]) -> None:
+        self.outcomes = list(outcomes)
+        self.prompts: list[BuiltPrompt] = []
+        self.factory_args: list[tuple[str, str]] = []
+
+    def factory(self, api_key: str, model: str) -> Callable[[BuiltPrompt], LlmResponse]:
+        self.factory_args.append((api_key, model))
+        return self._call
+
+    def _call(self, prompt: BuiltPrompt) -> LlmResponse:
+        self.prompts.append(prompt)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, LlmRequestError):
+            raise outcome
+        return LlmResponse(text=outcome, request_id="req-1", model="fake-model")
+
+
+def _forbid_caller(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbid(api_key: str, model: str) -> Callable[[BuiltPrompt], LlmResponse]:
+        raise AssertionError("이 경로는 OpenAI 호출 함수를 만들면 안 된다 (FR-030/FR-035)")
+
+    monkeypatch.setattr(watcher, "make_openai_caller", forbid)
+
+
+def _change_a_py(root: Path) -> Step:
+    def change(debouncer: Debouncer) -> None:
+        (root / "a.py").write_bytes(b"x = 2\n")
+        debouncer.observe(RawEvent(rel_path="a.py", kind="modified", at=0.0))
+
+    return change
+
+
+def test_no_change_session_never_builds_caller_even_with_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 불변식 (FR-035): 변경 없음이면 키가 있어도 OpenAI 호출 0회. calls: 0 이 증거로 남는다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [])
+    _forbid_caller(monkeypatch)
+
+    outcome = run_session(config, paths, selection, lambda line: None, WITH_KEY)
+
+    assert outcome.no_change is True
+    assert outcome.summary_state == watcher.SUMMARY_NOT_RUN
+    doc = _session_doc(paths)
+    assert doc["status"] == "completed"
+    assert doc["openai"] == {"calls": 0, "retries": 0, "model": None, "request_id": None}
+    assert not paths.summary_json.exists()
+
+
+def test_blocked_session_never_builds_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 불변식 (FR-036): secret scan 미통과면 키가 있어도 외부 전송(요약 호출)이 없다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_plant_secret(config.watch_root)])
+    _forbid_caller(monkeypatch)
+
+    outcome = run_session(config, paths, selection, lambda line: None, WITH_KEY)
+
+    assert outcome.secrets_blocked is True
+    assert outcome.summary_state == watcher.SUMMARY_NOT_RUN
+    doc = _session_doc(paths)
+    assert doc["status"] == "failed"
+    assert doc["error"] == "secrets_detected"
+    assert doc["openai"] == {"calls": 0, "retries": 0, "model": None, "request_id": None}
+
+
+def test_dry_run_writes_prompt_json_and_completes_without_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PRD 10.2: dry-run 은 외부 호출 없이 프롬프트까지만 검증하고 completed 로 끝난다.
+    config, paths, selection = _setup_session(tmp_path, dry_run=True)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    _forbid_caller(monkeypatch)
+    lines: list[str] = []
+
+    outcome = run_session(config, paths, selection, lines.append, WITH_KEY)
+
+    assert outcome.summary_state == watcher.SUMMARY_DRY_RUN
+    doc = _session_doc(paths)
+    assert doc["status"] == "completed"
+    assert "error" not in doc
+    assert doc["dry_run"] is True
+    assert doc["openai"] == {"calls": 0, "retries": 0, "model": None, "request_id": None}
+    prompt = json.loads(paths.prompt_json.read_text(encoding="utf-8"))
+    assert "<diff>" in prompt["user"]
+    assert prompt["response_schema"] == summarize.response_schema()
+    # 프롬프트 산출물에도 감시 루트 절대 경로가 없다 (FR-037).
+    assert str(config.watch_root) not in prompt["user"] + prompt["system"]
+    assert not paths.summary_json.exists()
+    assert any(line.startswith("[DRY-RUN]") for line in lines)
+    "\n".join(lines).encode("cp949")
+
+
+def test_successful_summary_writes_artifacts_and_counts_one_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    caller = _FakeCaller([VALID_SUMMARY_TEXT])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+    lines: list[str] = []
+
+    outcome = run_session(config, paths, selection, lines.append, WITH_KEY)
+
+    # 정상 경로 정확히 1회 (FR-030). 팩토리에는 키·모델이 그대로 전달된다.
+    assert len(caller.prompts) == 1
+    assert caller.factory_args == [(FAKE_KEY, "gpt-4o-mini")]
+    assert outcome.summary_state == watcher.SUMMARY_OK
+    doc = _session_doc(paths)
+    # 요약은 성공했지만 Discord(5단계)가 없어 partial 로 남는 과도기 매핑 (설계 6.6).
+    assert doc["status"] == "partial"
+    assert doc["error"] == watcher.ERROR_DISCORD_PENDING
+    assert doc["openai"] == {
+        "calls": 1,
+        "retries": 0,
+        "model": "fake-model",
+        "request_id": "req-1",
+    }
+    summary = json.loads(paths.summary_json.read_text(encoding="utf-8"))
+    assert summary["source"] == "openai"
+    assert summary["openai"] == {"calls": 1, "retries": 0, "request_id": "req-1"}
+    assert summary["summary"]["session_title"] == "검증"
+    # FR-037: 실제로 나간 프롬프트에 감시 루트 절대 경로·키가 없다.
+    [prompt] = caller.prompts
+    assert str(config.watch_root) not in prompt.user + prompt.system
+    assert FAKE_KEY not in prompt.user + prompt.system
+    assert "--- a/a.py" in prompt.user
+    assert any(line.startswith("[AI] 요약 저장:") for line in lines)
+    "\n".join(lines).encode("cp949")
+
+
+def test_summary_ok_with_no_discord_completes_exit_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config, paths, selection = _setup_session(tmp_path, no_discord=True)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    caller = _FakeCaller([VALID_SUMMARY_TEXT])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+
+    rc = cli.run_watch(cli.Preflight(config=config, selection=selection), paths, WITH_KEY)
+
+    # 사용자가 전송 생략을 명시했으므로 이 설정에서 할 일이 전부 끝났다 (설계 6.6, PRD 10.3).
+    assert rc == cli.EXIT_OK
+    doc = _session_doc(paths)
+    assert doc["status"] == "completed"
+    assert "error" not in doc
+    captured = capsys.readouterr()
+    assert "[DONE] 요약까지 완료했습니다. 전송은 생략합니다" in captured.out
+    captured.out.encode("cp949")
+    captured.err.encode("cp949")
+
+
+def test_double_schema_failure_falls_back_and_masks_error_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 2회 모두 스키마 실패 → 호출 2회 상한 + 규칙 기반 fallback (FR-030, FR-039).
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    bad_text = f"응답에 키가 되비쳤다 {FAKE_KEY}"
+    caller = _FakeCaller([bad_text, bad_text])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+    lines: list[str] = []
+
+    outcome = run_session(config, paths, selection, lines.append, WITH_KEY)
+
+    assert len(caller.prompts) == 2
+    assert outcome.summary_state == watcher.SUMMARY_FALLBACK
+    doc = _session_doc(paths)
+    assert doc["status"] == "partial"
+    assert doc["error"] == watcher.ERROR_DISCORD_PENDING
+    openai_fields = doc["openai"]
+    assert isinstance(openai_fields, dict)
+    assert openai_fields["calls"] == 2
+    assert openai_fields["retries"] == 1
+    summary = json.loads(paths.summary_json.read_text(encoding="utf-8"))
+    assert summary["source"] == "rule_based"
+    assert summary["model"] is None
+    assert summary["summary"]["summary"].startswith("[규칙 기반 요약]")
+    # FR-031 "제한적 보관" + FR-042: 발췌는 2건, 원문 키는 [MASKED] 로 치환된다.
+    raw_rows = paths.errors_jsonl.read_text(encoding="utf-8").splitlines()
+    rows = [json.loads(line) for line in raw_rows]
+    assert [row["attempt"] for row in rows] == [1, 2]
+    assert all(row["stage"] == "summarize" for row in rows)
+    assert all(row["error"] == "schema_validation" for row in rows)
+    assert all("[MASKED]" in row["raw_excerpt"] for row in rows)
+    assert FAKE_KEY not in "\n".join(raw_rows)
+    assert "[AI] 재시도까지 실패. 규칙 기반 요약으로 대체합니다" in lines
+    "\n".join(lines).encode("cp949")
+
+
+def test_transport_failure_records_partial_without_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PRD 12절: 전송 실패는 재시도·fallback 없이 partial 로 남긴다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    caller = _FakeCaller([LlmRequestError(KIND_TIMEOUT)])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+
+    outcome = run_session(config, paths, selection, lambda line: None, WITH_KEY)
+
+    assert len(caller.prompts) == 1
+    assert outcome.summary_state == watcher.SUMMARY_FAILED
+    doc = _session_doc(paths)
+    assert doc["status"] == "partial"
+    assert doc["error"] == "openai_timeout"
+    openai_fields = doc["openai"]
+    assert isinstance(openai_fields, dict)
+    assert openai_fields["calls"] == 1
+    assert not paths.summary_json.exists()
+
+
+def test_summary_write_failure_is_not_reported_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 요약을 만들고도 산출물을 못 썼다면 성공이 아니다 — 5단계가 없는 파일을 읽게 된다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    caller = _FakeCaller([VALID_SUMMARY_TEXT])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise OSError("디스크 꽉 참")
+
+    monkeypatch.setattr(watcher, "write_summary_json", boom)
+    outcome = run_session(config, paths, selection, lambda line: None, WITH_KEY)
+
+    assert outcome.summary_state == watcher.SUMMARY_FAILED
+    doc = _session_doc(paths)
+    assert doc["status"] == "partial"
+    assert doc["error"] == watcher.ERROR_SUMMARY_WRITE_FAILED
+    [row] = [
+        json.loads(line)
+        for line in paths.errors_jsonl.read_text(encoding="utf-8").splitlines()
+    ]
+    assert row["stage"] == "summarize"
+    assert row["error"] == "OSError"
+
+
+def test_llm_sensitive_flag_is_added_to_redaction_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PRD 11.3: 모델의 사후 신고는 전송 차단이 아니라 redaction.json 기록 + 경고 1줄이다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    flagged = json.loads(VALID_SUMMARY_TEXT)
+    flagged["sensitive_data_detected"] = True
+    caller = _FakeCaller([json.dumps(flagged, ensure_ascii=False)])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+    lines: list[str] = []
+
+    outcome = run_session(config, paths, selection, lines.append, WITH_KEY)
+
+    assert outcome.summary_state == watcher.SUMMARY_OK
+    redaction = json.loads(paths.redaction_json.read_text(encoding="utf-8"))
+    assert redaction["llm_sensitive_flag"] is True
+    assert paths.summary_json.exists()
+    assert any("모델이 비밀정보 의심을 신고했습니다" in line for line in lines)
+    "\n".join(lines).encode("cp949")
+
+
+def test_calls_happen_only_at_finalize_not_per_save_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 불변식 (FR-030): 저장 이벤트가 여러 번이어도 호출은 종료 시 1회뿐이다.
+    config, paths, selection = _setup_session(tmp_path)
+    root = config.watch_root
+
+    def second_change(debouncer: Debouncer) -> None:
+        (root / "a.py").write_bytes(b"x = 3\n")
+        debouncer.observe(RawEvent(rel_path="a.py", kind="modified", at=1.0))
+
+    _script_loop(monkeypatch, [_change_a_py(root), second_change])
+    caller = _FakeCaller([VALID_SUMMARY_TEXT])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+
+    outcome = run_session(config, paths, selection, lambda line: None, WITH_KEY)
+
+    assert outcome.logical_event_count == 2
+    assert len(caller.prompts) == 1
+    doc = _session_doc(paths)
+    openai_fields = doc["openai"]
+    assert isinstance(openai_fields, dict)
+    assert openai_fields["calls"] == 1
+
+
+# ── 순수 판정 함수 — summary_state 환원과 종료 매핑 표 전수 (설계 6.6, 기준 21) ──
+
+
+def _outcome_of(source: str | None, error: str | None) -> SummarizeOutcome:
+    return SummarizeOutcome(
+        source=source,
+        doc=None,
+        calls=1,
+        retries=0,
+        request_id=None,
+        model=None,
+        error=error,
+        http_status=None,
+        llm_sensitive_flag=False,
+        schema_failures=(),
+    )
+
+
+def test_resolve_summary_state_covers_all_branches() -> None:
+    ok = _outcome_of(summarize.SOURCE_OPENAI, None)
+    fallback = _outcome_of(summarize.SOURCE_RULE_BASED, None)
+    failed = _outcome_of(None, "openai_timeout")
+
+    assert resolve_summary_state(None, attempted=False, dry_run=False) == "not_run"
+    assert resolve_summary_state(None, attempted=True, dry_run=True) == "dry_run"
+    assert resolve_summary_state(None, attempted=True, dry_run=False) == "not_run"
+    assert resolve_summary_state(failed, attempted=True, dry_run=False) == "failed"
+    assert resolve_summary_state(fallback, attempted=True, dry_run=False) == "fallback"
+    assert resolve_summary_state(ok, attempted=True, dry_run=False) == "ok"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        # 설계 6.6 매핑 표 전 행. 종료 코드는 아래 run_watch 매핑 테스트가 고정한다.
+        ({"no_change": True}, (SessionStatus.COMPLETED, None)),
+        ({"secrets_blocked": True}, (SessionStatus.FAILED, "secrets_detected")),
+        ({"diff_failed": True}, (SessionStatus.PARTIAL, "diff_failed")),
+        ({"redaction_failed": True}, (SessionStatus.PARTIAL, "redaction_failed")),
+        ({"summary_state": "dry_run"}, (SessionStatus.COMPLETED, None)),
+        (
+            {"summary_state": "failed", "summary_error": "openai_key_missing"},
+            (SessionStatus.PARTIAL, "openai_key_missing"),
+        ),
+        (
+            {"summary_state": "failed", "summary_error": "openai_auth"},
+            (SessionStatus.PARTIAL, "openai_auth"),
+        ),
+        ({"summary_state": "ok", "no_discord": True}, (SessionStatus.COMPLETED, None)),
+        ({"summary_state": "fallback", "no_discord": True}, (SessionStatus.COMPLETED, None)),
+        (
+            {"summary_state": "ok"},
+            (SessionStatus.PARTIAL, "discord_pipeline_not_implemented"),
+        ),
+        (
+            {"summary_state": "fallback"},
+            (SessionStatus.PARTIAL, "discord_pipeline_not_implemented"),
+        ),
+        # 우선순위: 차단이 요약 실패보다 앞선다.
+        (
+            {"secrets_blocked": True, "summary_state": "failed", "summary_error": "openai_timeout"},
+            (SessionStatus.FAILED, "secrets_detected"),
+        ),
+    ],
+)
+def test_resolve_session_end_matches_design_table(
+    overrides: dict[str, object], expected: tuple[SessionStatus, str | None]
+) -> None:
+    params: dict[str, object] = {
+        "no_change": False,
+        "secrets_blocked": False,
+        "diff_failed": False,
+        "redaction_failed": False,
+        "summary_state": "not_run",
+        "summary_error": None,
+        "no_discord": False,
+    }
+    params.update(overrides)
+    assert resolve_session_end(**params) == expected  # type: ignore[arg-type]
+
+
+# ── cli 매핑 — summary_state → 콘솔·종료 코드 (설계 6.6 오른쪽 열) ─────────────
+
+
+@pytest.mark.parametrize(
+    ("summary_state", "no_discord", "expected_rc", "snippet"),
+    [
+        (watcher.SUMMARY_DRY_RUN, False, cli.EXIT_OK, "[DONE] dry-run"),
+        (watcher.SUMMARY_NOT_RUN, False, cli.EXIT_RUNTIME, "요약 단계까지 진행하지 못했습니다"),
+        (watcher.SUMMARY_FAILED, False, cli.EXIT_RUNTIME, "요약을 만들지 못했습니다"),
+        (watcher.SUMMARY_OK, True, cli.EXIT_OK, "전송은 생략합니다"),
+        (watcher.SUMMARY_FALLBACK, True, cli.EXIT_OK, "규칙 기반 요약을 저장했습니다"),
+        (
+            watcher.SUMMARY_OK,
+            False,
+            cli.EXIT_RUNTIME,
+            "Discord 전송 단계는 아직 구현되지 않았습니다",
+        ),
+    ],
+)
+def test_run_watch_maps_summary_state_to_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    summary_state: str,
+    no_discord: bool,
+    expected_rc: int,
+    snippet: str,
+) -> None:
+    config, paths, selection = _setup_session(tmp_path, no_discord=no_discord)
+    outcome = WatchOutcome(
+        statuses={"a.py": "modified"},
+        unstable=False,
+        logical_event_count=1,
+        no_change=False,
+        aborted=False,
+        secrets_blocked=False,
+        summary_state=summary_state,
+    )
+
+    def fake_run_session(
+        config_: WatchConfig,
+        paths_: SessionPaths,
+        selection_: Selection,
+        emit: Callable[[str], None],
+        secrets_: Secrets,
+        model_: str,
+    ) -> WatchOutcome:
+        return outcome
+
+    monkeypatch.setattr(cli, "run_session", fake_run_session)
+    rc = cli.run_watch(cli.Preflight(config=config, selection=selection), paths, WITH_KEY)
+
+    assert rc == expected_rc
+    captured = capsys.readouterr()
+    assert snippet in captured.out + captured.err
+    # 기준 23: 새 콘솔 문자열 전부 cp949 콘솔에서 안 깨진다 (HANDOFF (다) 재발 방지).
     captured.out.encode("cp949")
     captured.err.encode("cp949")

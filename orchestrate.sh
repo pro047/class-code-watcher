@@ -878,6 +878,58 @@ fi
 
 gate_human "설계 검토 — 여기서 틀리면 뒤가 전부 낭비다" "$WORK/DESIGN.md"
 
+# ─────────────────────────────────────────── 승인 범위 (PreToolUse 훅 연동)
+# `~/.claude/hooks/sensitive-path-guard.py` 는 auth·session·마이그레이션 같은 민감 경로를
+# 건드리는 Edit/Write 에 "ask" 를 건다. `-p` 는 비대화형이라 답할 사람이 없어 단계가
+# 산출물 없이 죽는다 — 훅 자신의 docstring 이 2026-08-24 alembic 사고로 기록해 둔 경로다.
+#
+# 그 훅에는 탈출구가 이미 있다: PIPELINE_APPROVED_SCOPE 가 가리키는 파일에 적힌 경로는
+# 통과시킨다. 여기서 그 목록을 **사람이 방금 승인한 DESIGN.md 에서** 뽑는다 —
+# 승인의 출처가 설계 문서이므로 방어선이 느슨해지는 것이 아니라 사람 승인에 묶인다.
+# 목록 밖 파일은 여전히 막힌다 (훅 in_approved_scope 의 주석 참조).
+#
+# 반드시 DESIGN 게이트 **뒤**에 둔다. 앞에 두면 승인 안 된 설계가 범위를 정한다.
+#
+# 2026-08-30 실측 사고: summarizer 주행의 impl 이 `src/class_watcher/session.py` 에서
+# 두 번 거부당했다. 이 리포의 session.py 는 인증이 아니라 세션 산출물 경로 모듈인데
+# 파일명으로 잡혔다. impl 은 BLOCKED 대신 경로 소유권을 다른 모듈로 옮겨 우회했고,
+# 설계와 코드가 갈라진 채 남았다.
+build_approved_scope() {
+  local design=$1 out=$2
+  # DESIGN.md "변경 대상 파일" 표의 **첫 열**에서만 백틱 경로를 뽑는다. 3열(설명)에는
+  # `summary.json`·`_finalize` 처럼 경로가 아닌 백틱 토큰이 섞여 있다.
+  awk '
+    /^#+ .*변경 대상 파일/ { inside=1; next }
+    inside && /^#+ / { inside=0 }
+    inside && /^---+$/ { inside=0 }
+    inside && /^\|/ {
+      n = split($0, cell, "|")
+      if (n < 3) next
+      first = cell[2]
+      while (match(first, /`[^`]+`/)) {
+        tok = substr(first, RSTART + 1, RLENGTH - 2)
+        first = substr(first, RSTART + RLENGTH)
+        if (tok ~ /^[A-Za-z0-9_.\/-]+\.[A-Za-z0-9]+$/) print tok
+      }
+    }
+  ' "$design" | sort -u > "$out"
+}
+
+build_approved_scope "$WORK/DESIGN.md" "$WORK/APPROVED_SCOPE.txt"
+SCOPE_COUNT="$(grep -c . "$WORK/APPROVED_SCOPE.txt" || true)"
+if [ "$SCOPE_COUNT" -gt 0 ]; then
+  # impl·verify 가 띄우는 claude 프로세스가 상속한다. design·judge 는 소스를 안 쓰므로
+  # 주지 않는다 — 범위는 좁을수록 좋다.
+  export PIPELINE_APPROVED_SCOPE="$WORK/APPROVED_SCOPE.txt"
+  log "승인 범위 $SCOPE_COUNT 개 → APPROVED_SCOPE.txt (민감 경로 훅이 이 목록만 통과시킨다)"
+else
+  # 파싱 실패는 죽일 일이 아니다. 변수를 안 주면 훅은 원래대로 동작한다(fail-safe) —
+  # 최악이 "이 배선이 없던 때와 같음"이다. 다만 조용히 넘어가면 안 된다.
+  log "⚠ DESIGN.md 에서 변경 대상 파일을 못 뽑았다 — 민감 경로 훅이 원래대로 동작한다"
+  log "  표 형식이 바뀌었는지 확인해라: '## 변경 대상 파일' 아래 표의 첫 열이 백틱 경로여야 한다"
+fi
+
+
 while :; do
   ATTEMPT=$((ATTEMPT + 1))
   log "── 시도 $ATTEMPT/$((MAX_RETRY + 1))"

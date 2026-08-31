@@ -131,15 +131,58 @@ FALLBACK_VERIFY="${FALLBACK_VERIFY:-claude-opus-5,claude-sonnet-5}"
 # 실질 브레이크는 예산이다. 턴 상한은 무한루프 탈출용으로만 둔다 —
 # 턴으로 조이면 "일은 잘 하는데 상한에 걸려 죽는" 낭비가 생긴다.
 # 적용된 값은 STATE.md 의 RUNNING note 에 찍힌다 (다음 주행에서 근거가 쌓이도록).
-TURNS_DESIGN="${TURNS_DESIGN:-40}"
-TURNS_JUDGE="${TURNS_JUDGE:-40}"
-TURNS_IMPL="${TURNS_IMPL:-80}"
-TURNS_VERIFY="${TURNS_VERIFY:-40}"
+# 상향 (2026-08-31). 5단계 notifier 주행에서 **한 번에 두 단계가 턴으로 죽었다**:
+#   judge  턴 41/40 사망 — $3.47 버려짐 (예산은 $4.53 남아 있었다)
+#   verify 턴 41/40 사망 — $6.77 버려짐 (예산은 $3.23 남아 있었다)
+# 둘 다 일을 거의 끝낸 상태였다 — verify 는 테스트를 다 쓰고 마지막 확인에서 죽어,
+# 게이트 3종이 녹색인데 VERIFY.md 만 없는 상태를 남겼다.
+#
+# 0~4단계에서 40 이 충분했던 것은 기능이 작아서다 (verify 실적 18~27턴).
+# 5단계는 신규 모듈 2개 + 테스트 107개라 넘었다. **기능이 커지면 턴도 커진다** —
+# 위 주석대로 턴은 무한루프 탈출용이므로 실적보다 넉넉히 둔다.
+TURNS_DESIGN="${TURNS_DESIGN:-60}"    # 실적 11~24
+TURNS_JUDGE="${TURNS_JUDGE:-80}"      # 실적 22~70, 41 에서 사망
+TURNS_IMPL="${TURNS_IMPL:-80}"        # 실적 22~70 (유지)
+TURNS_VERIFY="${TURNS_VERIFY:-80}"    # 실적 18~27, 41 에서 사망
 
-BUDGET_DESIGN="${BUDGET_DESIGN:-5}"
-BUDGET_JUDGE="${BUDGET_JUDGE:-5}"
-BUDGET_IMPL="${BUDGET_IMPL:-8}"
-BUDGET_VERIFY="${BUDGET_VERIFY:-5}"
+# 기본값 상향 (2026-08-31). 근거는 이 저장소의 4 feature / 32 스테이지 실적이다
+# (`.pipeline/*/*.result.json` 의 total_cost_usd 를 집계했다):
+#
+#   단계    실적 범위        예전 기본  새 기본
+#   design  $2.16 ~ $4.28      $5        $8
+#   judge   $4.22 ~ $5.72      $5        $8     <- $5 를 이미 넘긴 주행이 3건
+#   impl    $1.32 ~ $5.55      $8        $8     (유지 — 여유 있음)
+#   verify  $3.88 ~ $5.58      $5       $10
+#
+# 예전 기본값이 실적 상한보다 낮아서 **예산 소진으로 죽은 것이 2건 $10.02** 였다
+# (watch-engine verify.attempt2, judge 1건 — 둘 다 subtype=error_max_budget_usd).
+# 예산으로 죽으면 그 단계가 그때까지 쓴 돈이 통째로 버려지므로, 상한을 조이는 것이
+# 오히려 비싸다. 상한은 "폭주 차단"용이지 "절약"용이 아니다.
+#
+# 실제 절약 레버는 따로 있다 — 재시도 $47.08 중 하네스 설정 몫이 $22.17 이고,
+# 그 중 레이트리밋이 $12.15 다(27턴까지 일하고 버려진 건이 2건). 예산 상향은
+# 그 중 $10.02 를 회수하는 것이고, 나머지는 레이트리밋 대응이 풀어야 한다.
+# **기본값 없음 (2026-08-31).** 빈 값이면 --max-budget-usd 를 아예 안 붙인다.
+#
+# 없앤 근거는 실적이다. 4 feature / 40 주행을 전수 조사한 결과:
+#   - **폭주(무한루프·무한지출) 사례 0건.** 어떤 주행도 70턴을 안 넘겼다
+#   - 권한 거부는 흔하지만(0~12회) 사망과 상관이 없다 — 거부 12회에 70턴 쓴
+#     redactor impl 은 정상 완료했고, 거부 1회짜리 notifier verify 가 턴으로 죽었다
+#   - **상한이 발동한 4번은 전부 정상 작업을 죽였다** (예산 2건 $10.02 + 턴 2건 $10.24).
+#     그 중 notifier verify 는 테스트를 다 쓰고 마지막 확인에서 죽어, 게이트 3종이
+#     녹색인데 VERIFY.md 만 없는 상태를 남겼다
+#
+# **상한은 돈을 아끼지 않는다. 이미 쓴 돈을 살릴지 버릴지만 정한다** — 쓸모 있는
+# 작업과 없는 작업을 구별하지 못하기 때문이다. 실적 최댓값의 1.1~1.4배에 두면
+# 차단기가 아니라 목줄이 된다 (impl 은 실적 $7.37 에 상한 $8 이었다).
+#
+# 폭주가 걱정되면 되살려라 — 값만 주면 그대로 동작한다:
+#   BUDGET_IMPL=20 ./orchestrate.sh <feature>
+# 턴 상한(위)은 그대로 남아 있어 실질적인 상한 역할을 계속 한다.
+BUDGET_DESIGN="${BUDGET_DESIGN:-}"
+BUDGET_JUDGE="${BUDGET_JUDGE:-}"
+BUDGET_IMPL="${BUDGET_IMPL:-}"
+BUDGET_VERIFY="${BUDGET_VERIFY:-}"
 
 MODEL_LOG=""   # WORK 확정 후 아래에서 설정
 
@@ -394,7 +437,10 @@ run_stage() {
   local upper turns_var budget_var turns budget
   upper="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
   turns_var="TURNS_$upper"; budget_var="BUDGET_$upper"
-  turns="${!turns_var:-40}"; budget="${!budget_var:-5}"
+  turns="${!turns_var:-40}"; budget="${!budget_var:-}"
+  # 예산이 비면 상한을 안 건다 (기본값). 로그·STATE 표기도 그에 맞춘다.
+  local budget_desc
+  if [ -n "$budget" ]; then budget_desc="예산≤\$$budget"; else budget_desc="예산 상한 없음"; fi
 
   # 재시도가 이전 시도의 증거를 덮어쓰지 않게 한다. 고정 이름은 유지하고(사람·테스트·
   # 도구가 그 경로를 안다) 덮어쓰기 직전에 이전 것을 번호로 밀어둔다.
@@ -428,8 +474,8 @@ run_stage() {
     try_model="${chain%%,*}"
     rest="${chain#*,}"; [ "$rest" = "$chain" ] && rest=""
 
-    state "RUNNING:$name" "model=$try_model, 턴≤$turns, 예산≤\$$budget"
-    log "▶ $name (model=$try_model, fallback=${rest:-없음}, 턴≤$turns, 예산≤\$$budget)"
+    state "RUNNING:$name" "model=$try_model, 턴≤$turns, $budget_desc"
+    log "▶ $name (model=$try_model, fallback=${rest:-없음}, 턴≤$turns, $budget_desc)"
 
     set +e
     envsubst < "$prompt_file" | claude -p \
@@ -438,7 +484,7 @@ run_stage() {
       --output-format stream-json \
       --verbose \
       --max-turns "$turns" \
-      --max-budget-usd "$budget" \
+      ${budget:+--max-budget-usd "$budget"} \
       --permission-mode acceptEdits \
       --allowedTools "$GATE_TOOLS" \
       --append-system-prompt "$(cat "$PROMPTS/_contract.md")" \

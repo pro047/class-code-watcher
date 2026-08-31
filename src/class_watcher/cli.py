@@ -28,6 +28,7 @@ from .config import (
     mask_secrets,
     merge_env,
 )
+from .notify import DISCORD_SENT, cleanup_notice, console_safe
 from .openai_client import DEFAULT_OPENAI_MODEL, resolve_model
 from .selector import Selection, scan_files
 from .session import (
@@ -227,7 +228,14 @@ def run_watch(
     if preflight.config.no_discord:
         _emit(f"[DONE] 요약까지 완료했습니다. 전송은 생략합니다: {paths.root}", secrets)
         return EXIT_OK
-    _emit_error("[FAILED] Discord 전송 단계는 아직 구현되지 않았습니다.", secrets)
+    if outcome.discord_state == DISCORD_SENT:
+        _emit(f"[DONE] 요약과 Discord 전송을 완료했습니다: {paths.root}", secrets)
+        return EXIT_OK
+    # PRD 10.3 의 4종 제약 때문에 전송 실패는 기존 코드 1을 재사용한다. 4xx/5xx/timeout
+    # 구분은 session.json 의 error 가 한다 (C-10).
+    _emit_error("[FAILED] Discord 전송에 실패했습니다.", secrets)
+    _emit_error(f"       보낼 내용은 그대로 남아 있습니다: {paths.discord_payload_json}", secrets)
+    _emit_error("       원인은 session.json 의 error 를 확인하세요.", secrets)
     _emit_error(f"       세션 산출물은 보존됩니다: {paths.root}", secrets)
     return EXIT_RUNTIME
 
@@ -238,12 +246,29 @@ def _record_failure(paths: SessionPaths, error: str) -> None:
     write_session_json(paths, transition(doc, SessionStatus.FAILED, error=error))
 
 
+def _console_encoding() -> str | None:
+    """sys.stdout.encoding 을 읽는 유일한 자리.
+
+    한국어 Windows 에서 stdout 이 파일·파이프로 리다이렉트되면 cp949 가 된다.
+    """
+    encoding = getattr(sys.stdout, "encoding", None)
+    return encoding if isinstance(encoding, str) else None
+
+
 def _emit(message: str, secrets: Secrets) -> None:
-    print(mask_secrets(message, secrets))
+    # 마스킹이 먼저다 — 무해화가 비밀값 문자열을 깨뜨려 마스킹이 못 잡는 일이 없도록.
+    print(console_safe(mask_secrets(message, secrets), _console_encoding()))
 
 
 def _emit_error(message: str, secrets: Secrets) -> None:
-    print(mask_secrets(message, secrets), file=sys.stderr)
+    print(console_safe(mask_secrets(message, secrets), _console_encoding()), file=sys.stderr)
+
+
+def _print_cleanup_notice(paths: SessionPaths, secrets: Secrets) -> None:
+    """FR-053. 환경변수는 이름만 알리고 존재 여부를 찍지 않는다 (FR-003)."""
+    existing = [str(path) for path in _dotenv_candidates() if path.is_file()]
+    for line in cleanup_notice(str(paths.root), existing):
+        _emit(line, secrets)
 
 
 def _dotenv_candidates() -> tuple[Path, ...]:
@@ -318,6 +343,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OSError as exc:
         _emit_error(f"[ERROR] 실행 중 실패: {exc}", secrets)
         return EXIT_RUNTIME
+    finally:
+        # FR-053: 세션 디렉터리가 만들어진 모든 종료 경로의 맨 마지막에 한 번 나온다.
+        # run_watch 안이 아니라 여기인 이유는 그쪽 return 지점이 9개라서다 — 한 곳을
+        # 빠뜨리면 P1 요구사항이 조용히 새는 형태가 된다.
+        _print_cleanup_notice(paths, secrets)
 
 
 if __name__ == "__main__":

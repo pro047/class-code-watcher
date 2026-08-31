@@ -8,7 +8,7 @@
 
 import json
 import queue
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
@@ -19,9 +19,10 @@ from watchdog.events import (
     FileMovedEvent,
 )
 
-from class_watcher import cli, snapshot, summarize, watcher
+from class_watcher import cli, notify, snapshot, summarize, watcher
 from class_watcher.config import DEFAULT_EXCLUDE, Secrets, WatchConfig
 from class_watcher.debounce import Debouncer, RawEvent
+from class_watcher.notify import DeliveryOutcome, DiscordRequestError, find_diff_lines
 from class_watcher.selector import Selection, is_watched, scan_files
 from class_watcher.session import (
     SessionPaths,
@@ -1050,9 +1051,17 @@ def test_successful_summary_writes_artifacts_and_counts_one_call(
     assert caller.factory_args == [(FAKE_KEY, "gpt-4o-mini")]
     assert outcome.summary_state == watcher.SUMMARY_OK
     doc = _session_doc(paths)
-    # 요약은 성공했지만 Discord(5단계)가 없어 partial 로 남는 과도기 매핑 (설계 6.6).
+    # WITH_KEY 에는 Webhook URL 이 없다. 사용자가 --no-discord 를 주지 않았으므로 전송을
+    # 기대한 것이고, 그래서 생략이 아니라 실패다 (5단계 설계 5.6).
     assert doc["status"] == "partial"
-    assert doc["error"] == watcher.ERROR_DISCORD_PENDING
+    assert doc["error"] == notify.ERROR_DISCORD_URL_MISSING
+    assert doc["discord"] == {
+        "delivered": False,
+        "http_status": None,
+        "requests": 0,
+        "chunks": 0,
+        "skip_reason": None,
+    }
     assert doc["openai"] == {
         "calls": 1,
         "retries": 0,
@@ -1110,7 +1119,8 @@ def test_double_schema_failure_falls_back_and_masks_error_log(
     assert outcome.summary_state == watcher.SUMMARY_FALLBACK
     doc = _session_doc(paths)
     assert doc["status"] == "partial"
-    assert doc["error"] == watcher.ERROR_DISCORD_PENDING
+    # 위와 같은 이유 — WITH_KEY 에는 Webhook URL 이 없다 (5단계 설계 5.6).
+    assert doc["error"] == notify.ERROR_DISCORD_URL_MISSING
     openai_fields = doc["openai"]
     assert isinstance(openai_fields, dict)
     assert openai_fields["calls"] == 2
@@ -1227,6 +1237,483 @@ def test_calls_happen_only_at_finalize_not_per_save_event(
     assert openai_fields["calls"] == 1
 
 
+# ── 5단계 전송 배선 — 계수·산출물·상태 매핑 (FR-033~035, 050~052) ─────────────
+#
+# mock 경계는 SendFn 하나다: watcher.make_discord_sender 를 가짜 팩토리로 갈아끼우면
+# httpx·네트워크 없이 전 경로가 돈다 (설계 6절 케이스 25~32, IMPL 4.2).
+#
+# 주의: WITH_KEY 의 discord_webhook_url 은 None 이다. 실제 전송 경로를 타려면 아래
+# WITH_DISCORD 를 쓰고 반드시 팩토리를 갈아끼워야 한다 — 안 그러면 진짜 요청이 나간다.
+
+FAKE_WEBHOOK = "https://discord.example/api/webhooks/1234567890/super-secret-token"
+WITH_DISCORD = Secrets(openai_api_key=FAKE_KEY, discord_webhook_url=FAKE_WEBHOOK)
+
+
+class _FakeSender:
+    """make_discord_sender 자리의 가짜 팩토리. 요청 1회 = _send 1회다."""
+
+    def __init__(self, outcomes: list[int | DiscordRequestError]) -> None:
+        self.outcomes = list(outcomes)
+        self.payloads: list[dict[str, object]] = []
+        self.urls: list[str] = []
+
+    def factory(self, webhook_url: str) -> Callable[[Mapping[str, object]], int]:
+        self.urls.append(webhook_url)
+        return self._send
+
+    def _send(self, payload: Mapping[str, object]) -> int:
+        self.payloads.append(dict(payload))
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, DiscordRequestError):
+            raise outcome
+        return outcome
+
+
+def _forbid_sender(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbid(webhook_url: str) -> Callable[[Mapping[str, object]], int]:
+        raise AssertionError("이 경로는 Discord 전송 함수를 만들면 안 된다 (FR-035/FR-052)")
+
+    monkeypatch.setattr(watcher, "make_discord_sender", forbid)
+
+
+def _discord_fields(paths: SessionPaths) -> dict[str, object]:
+    fields = _session_doc(paths)["discord"]
+    assert isinstance(fields, dict)
+    return fields
+
+
+def test_no_change_session_sends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 케이스 26 · 불변식 (FR-035): 변경 없음이면 OpenAI·Discord 모두 0회. 두 계수가
+    # 전부 session.json 에 남아 사후에 증명된다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [])
+    _forbid_caller(monkeypatch)
+    _forbid_sender(monkeypatch)
+
+    outcome = run_session(config, paths, selection, lambda line: None, WITH_DISCORD)
+
+    assert outcome.no_change is True
+    assert outcome.discord_state == notify.DISCORD_SKIPPED
+    doc = _session_doc(paths)
+    assert doc["status"] == "completed"
+    assert doc["openai"] == {"calls": 0, "retries": 0, "model": None, "request_id": None}
+    assert doc["discord"] == {
+        "delivered": False,
+        "http_status": None,
+        "requests": 0,
+        "chunks": 0,
+        "skip_reason": notify.SKIP_NO_CHANGE,
+    }
+    assert not paths.discord_payload_json.exists()
+
+
+def test_blocked_session_sends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 케이스 27 · 불변식 (FR-036): 비밀값 탐지 세션은 요약도 전송도 하지 않는다.
+    # 차단 판정을 재해석하는 분기가 생기면 여기서 잡힌다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_plant_secret(config.watch_root)])
+    _forbid_caller(monkeypatch)
+    _forbid_sender(monkeypatch)
+
+    outcome = run_session(config, paths, selection, lambda line: None, WITH_DISCORD)
+
+    assert outcome.secrets_blocked is True
+    assert outcome.discord_state == notify.DISCORD_SKIPPED
+    doc = _session_doc(paths)
+    assert doc["status"] == "failed"
+    assert doc["error"] == "secrets_detected"
+    assert _discord_fields(paths)["skip_reason"] == notify.SKIP_SECRETS_BLOCKED
+    assert _discord_fields(paths)["requests"] == 0
+    assert not paths.discord_payload_json.exists()
+
+
+def test_dry_run_session_sends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 케이스 28: dry-run 은 성공적 생략이다 — "요약 없음"과 같은 분기로 묶지 않는다.
+    config, paths, selection = _setup_session(tmp_path, dry_run=True)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    _forbid_caller(monkeypatch)
+    _forbid_sender(monkeypatch)
+
+    outcome = run_session(config, paths, selection, lambda line: None, WITH_DISCORD)
+
+    assert outcome.discord_state == notify.DISCORD_SKIPPED
+    doc = _session_doc(paths)
+    assert doc["status"] == "completed"
+    assert "error" not in doc
+    assert _discord_fields(paths)["skip_reason"] == notify.SKIP_DRY_RUN
+    assert not paths.discord_payload_json.exists()
+
+
+def test_no_discord_session_renders_to_console_and_keeps_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 케이스 29 (판정 8번): --no-discord 세션도 실행자가 요약을 볼 수 있어야 하고,
+    # 나중에 손으로 붙여 넣을 payload 가 남아야 한다.
+    config, paths, selection = _setup_session(tmp_path, no_discord=True)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    caller = _FakeCaller([VALID_SUMMARY_TEXT])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+    _forbid_sender(monkeypatch)
+    lines: list[str] = []
+
+    outcome = run_session(config, paths, selection, lines.append, WITH_DISCORD)
+
+    assert outcome.discord_state == notify.DISCORD_SKIPPED
+    doc = _session_doc(paths)
+    assert doc["status"] == "completed"
+    assert "error" not in doc
+    assert _discord_fields(paths)["skip_reason"] == notify.SKIP_NO_DISCORD
+    assert _discord_fields(paths)["requests"] == 0
+    # 콘솔에 렌더된 요약 전문이 나간다 (전송 성공·실패·생략을 가리지 않는다).
+    joined = "\n".join(lines)
+    assert notify.TITLE_PREFIX + "검증" in joined
+    assert "값을 바꾸는 변경을 했다." in joined
+    joined.encode("cp949")
+    # 전송 시도 전에 쓰므로 --no-discord 에서도 남는다 (PRD 12절 복구 원칙).
+    payload = json.loads(paths.discord_payload_json.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "1.1"
+    assert payload["chunks"] == 1
+    assert FAKE_WEBHOOK not in paths.discord_payload_json.read_text(encoding="utf-8")
+
+
+def test_delivery_failure_preserves_every_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 케이스 30 (FR-034, PRD 12절): 전송이 실패해도 로컬 산출물은 전부 남고 상태 코드가
+    # 기록된다. payload 는 전송 "전"에 썼으므로 수동 복사 경로가 성립한다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    caller = _FakeCaller([VALID_SUMMARY_TEXT])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+    sender = _FakeSender([DiscordRequestError(notify.KIND_HTTP, http_status=404)])
+    monkeypatch.setattr(watcher, "make_discord_sender", sender.factory)
+    lines: list[str] = []
+
+    outcome = run_session(config, paths, selection, lines.append, WITH_DISCORD)
+
+    assert outcome.discord_state == notify.DISCORD_FAILED
+    doc = _session_doc(paths)
+    assert doc["status"] == "partial"
+    # 4xx 와 5xx 를 error 값으로 가른다 — 종료 코드는 둘 다 1이다 (C-10).
+    assert doc["error"] == "discord_http_404"
+    assert doc["discord"] == {
+        "delivered": False,
+        "http_status": 404,
+        "requests": 0,
+        "chunks": 1,
+        "skip_reason": None,
+    }
+    for path in (
+        paths.baseline_dir / "a.py",
+        paths.final_dir / "a.py",
+        paths.final_diff,
+        paths.stats_json,
+        paths.summary_json,
+        paths.discord_payload_json,
+        paths.session_json,
+    ):
+        assert path.exists(), f"{path} 가 사라졌다"
+    joined = "\n".join(lines)
+    assert "Discord 전송에 실패했습니다" in joined
+    assert FAKE_WEBHOOK not in joined
+    joined.encode("cp949")
+
+
+def test_session_without_summary_shows_stats_only_and_sends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 케이스 31 (판정 10번): 보낼 내용이 없는데 알림을 쓰는 것은 FR-052 와 어긋난다.
+    # 대신 실행자에게 통계와 산출물 경로를 보여 준다. 4단계 error 는 그대로 남는다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    caller = _FakeCaller([LlmRequestError(KIND_TIMEOUT)])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+    _forbid_sender(monkeypatch)
+    lines: list[str] = []
+
+    outcome = run_session(config, paths, selection, lines.append, WITH_DISCORD)
+
+    assert outcome.summary_state == watcher.SUMMARY_FAILED
+    assert outcome.discord_state == notify.DISCORD_SKIPPED
+    doc = _session_doc(paths)
+    assert doc["status"] == "partial"
+    assert doc["error"] == "openai_timeout"
+    assert _discord_fields(paths)["skip_reason"] == notify.SKIP_NO_SUMMARY
+    assert _discord_fields(paths)["requests"] == 0
+    assert not paths.discord_payload_json.exists()
+    joined = "\n".join(lines)
+    assert "[요약 없음] 검증" in joined
+    assert "openai_timeout" in joined
+    assert str(paths.root) in joined
+    joined.encode("cp949")
+
+
+def test_successful_delivery_counts_one_request_and_records_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 케이스 32: 정상 세션은 OpenAI 1회 + Discord 1회다 (FR-030, FR-052).
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    caller = _FakeCaller([VALID_SUMMARY_TEXT])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+    sender = _FakeSender([204])
+    monkeypatch.setattr(watcher, "make_discord_sender", sender.factory)
+    lines: list[str] = []
+
+    outcome = run_session(config, paths, selection, lines.append, WITH_DISCORD)
+
+    assert len(caller.prompts) == 1
+    assert len(sender.payloads) == 1
+    assert sender.urls == [FAKE_WEBHOOK]
+    assert outcome.discord_state == notify.DISCORD_SENT
+    doc = _session_doc(paths)
+    assert doc["status"] == "completed"
+    assert "error" not in doc
+    assert doc["discord"] == {
+        "delivered": True,
+        "http_status": 204,
+        "requests": 1,
+        "chunks": 1,
+        "skip_reason": None,
+    }
+    content = sender.payloads[0]["content"]
+    assert isinstance(content, str)
+    assert content.startswith(notify.TITLE_PREFIX)
+    # 산출물의 payload 와 실제로 나간 것이 같아야 수동 복사 경로가 의미를 갖는다.
+    saved = json.loads(paths.discord_payload_json.read_text(encoding="utf-8"))
+    assert saved["payloads"] == [{"content": content}]
+    assert FAKE_WEBHOOK not in "\n".join(lines)
+
+
+def test_delivered_payload_carries_no_diff_lines_or_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 불변식 (FR-051): 모델이 diff 원문을 evidence·description 에 옮겨 와도 전송
+    # payload 에는 `+`/`-` 로 시작하는 줄이 없고 evidence 자체가 실리지 않는다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    leaked = "+ String pw = user.getPassword();"
+    payload_text = json.dumps(
+        {
+            "session_title": "검증",
+            "summary": "- 값을 바꾸는 변경을 했다.",
+            "change_stats": {"files_changed": 1, "added_lines": 1, "deleted_lines": 1},
+            "changes": [
+                {
+                    "file": "a.py",
+                    "area": "핵심",
+                    "type": "modified",
+                    "description": "--- a/a.py 를 고쳤다",
+                    "evidence": f"--- a/a.py\n{leaked}",
+                }
+            ],
+            "learning_points": [],
+            "questions_to_review": [],
+            "risks_or_todos": [],
+            "sensitive_data_detected": False,
+        },
+        ensure_ascii=False,
+    )
+    caller = _FakeCaller([payload_text])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+    sender = _FakeSender([204])
+    monkeypatch.setattr(watcher, "make_discord_sender", sender.factory)
+
+    run_session(config, paths, selection, lambda line: None, WITH_DISCORD)
+
+    [sent] = sender.payloads
+    content = sent["content"]
+    assert isinstance(content, str)
+    assert find_diff_lines(content) == ()
+    assert leaked not in content
+    assert "getPassword" not in content
+    assert "핵심" not in content
+    # 산출물 쪽 payload 도 같은 보장을 받는다.
+    saved = json.loads(paths.discord_payload_json.read_text(encoding="utf-8"))
+    for entry in saved["payloads"]:
+        assert find_diff_lines(entry["content"]) == ()
+    # summary.json 에는 evidence 가 그대로 남는다 — 메시지에서만 뺀다 (판정 9번 ③).
+    summary = json.loads(paths.summary_json.read_text(encoding="utf-8"))
+    assert summary["summary"]["changes"][0]["evidence"]
+
+
+def test_payload_write_failure_stops_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 설계 5.10: 로컬 보존이 성립하지 않는 상태로 외부에 나가지 않는다 (PRD 12절).
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    caller = _FakeCaller([VALID_SUMMARY_TEXT])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+    _forbid_sender(monkeypatch)
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise OSError("디스크 꽉 참")
+
+    monkeypatch.setattr(watcher, "write_payload_json", boom)
+    lines: list[str] = []
+
+    outcome = run_session(config, paths, selection, lines.append, WITH_DISCORD)
+
+    assert outcome.discord_state == notify.DISCORD_FAILED
+    doc = _session_doc(paths)
+    assert doc["status"] == "partial"
+    assert doc["error"] == notify.ERROR_DISCORD_PAYLOAD_FAILED
+    assert _discord_fields(paths)["requests"] == 0
+    rows = [
+        json.loads(line)
+        for line in paths.errors_jsonl.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["stage"] for row in rows] == ["notify"]
+    assert rows[0]["error"] == "OSError"
+    assert any("외부 전송은 하지 않습니다" in line for line in lines)
+
+
+def test_aborted_session_still_records_a_discord_counter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 전 세션에 discord 필드가 남는다 — "전송 0회"를 사후 집계로 증명하려면 abort
+    # 세션에도 계수가 있어야 한다 (설계 5.5, 4단계 openai.calls: 0 과 같은 논리).
+    config, paths, selection = _setup_session(tmp_path)
+
+    def second_ctrl_c(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    monkeypatch.setattr(watcher, "wait_for_stability", second_ctrl_c)
+    _forbid_sender(monkeypatch)
+
+    outcome = run_session(config, paths, selection, lambda line: None, WITH_DISCORD)
+
+    assert outcome.aborted is True
+    assert outcome.discord_state == notify.DISCORD_NOT_RUN
+    assert _discord_fields(paths) == {
+        "delivered": False,
+        "http_status": None,
+        "requests": 0,
+        "chunks": 0,
+        "skip_reason": None,
+    }
+
+
+# ── 불변식 회귀 — 5단계 배선이 앞 단계의 계수·순서를 흔들지 않는다 ──────────────
+
+
+def test_repeated_save_events_still_send_exactly_one_discord_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 불변식 (FR-030 저장 이벤트 중 0회 + FR-052 알림 예산): 저장이 몇 번이든 외부
+    # 요청은 종료 시 OpenAI 1회 / Discord 1회다. 5단계 배선이 이벤트 루프 안으로
+    # 내려오면 여기서 잡힌다.
+    config, paths, selection = _setup_session(tmp_path)
+    root = config.watch_root
+
+    def second_change(debouncer: Debouncer) -> None:
+        (root / "a.py").write_bytes(b"x = 3\n")
+        debouncer.observe(RawEvent(rel_path="a.py", kind="modified", at=1.0))
+
+    _script_loop(monkeypatch, [_change_a_py(root), second_change])
+    caller = _FakeCaller([VALID_SUMMARY_TEXT])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+    sender = _FakeSender([204])
+    monkeypatch.setattr(watcher, "make_discord_sender", sender.factory)
+
+    outcome = run_session(config, paths, selection, lambda line: None, WITH_DISCORD)
+
+    assert outcome.logical_event_count == 2
+    assert len(caller.prompts) == 1
+    assert len(sender.payloads) == 1
+    doc = _session_doc(paths)
+    assert doc["openai"] == {
+        "calls": 1,
+        "retries": 0,
+        "model": "fake-model",
+        "request_id": "req-1",
+    }
+    assert _discord_fields(paths)["requests"] == 1
+    # 불변식 (FR-020): 이 세션에는 git 저장소가 없다. 그래도 diff 와 집계가 만들어졌고
+    # 그 결과가 전송 경로까지 흘러간다 — 전송 배선이 diff 출처를 바꾸지 않는다.
+    assert not (root / ".git").exists()
+    assert not (paths.root / ".git").exists()
+    diff_text = paths.final_diff.read_text(encoding="utf-8")
+    assert "+x = 3" in diff_text
+    stats = json.loads(paths.stats_json.read_text(encoding="utf-8"))
+    assert stats["totals"] == {
+        "files_changed": 1,
+        "added_lines": 1,
+        "deleted_lines": 1,
+        "skipped": 0,
+    }
+
+
+def test_fallback_session_caps_openai_at_two_calls_and_sends_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 불변식 (FR-030 상한 2회): 재시도까지 실패해도 호출은 2회에서 멈추고, 규칙 기반
+    # 요약이 Discord 로 1회 나간다. FR-039 표시가 실제로 나간 본문에 있는지도 본다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    bad_text = "스키마에 맞지 않는 응답"
+    caller = _FakeCaller([bad_text, bad_text])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+    sender = _FakeSender([204])
+    monkeypatch.setattr(watcher, "make_discord_sender", sender.factory)
+
+    outcome = run_session(config, paths, selection, lambda line: None, WITH_DISCORD)
+
+    assert outcome.summary_state == watcher.SUMMARY_FALLBACK
+    assert len(caller.prompts) == 2
+    assert len(sender.payloads) == 1
+    doc = _session_doc(paths)
+    assert doc["status"] == "completed"
+    openai_fields = doc["openai"]
+    assert isinstance(openai_fields, dict)
+    assert openai_fields["calls"] == 2
+    assert _discord_fields(paths) == {
+        "delivered": True,
+        "http_status": 204,
+        "requests": 1,
+        "chunks": 1,
+        "skip_reason": None,
+    }
+    content = sender.payloads[0]["content"]
+    assert isinstance(content, str)
+    assert notify.RULE_BASED_NOTICE in content
+
+
+def test_delivery_only_happens_after_a_clean_secret_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 불변식 (FR-036): 외부로 나간 세션은 반드시 스캔을 통과한 세션이다. 차단 쪽은
+    # test_blocked_session_sends_nothing 이 보고, 여기서는 통과 쪽을 고정한다 —
+    # 스캔을 건너뛰고 전송하는 경로가 생기면 redaction.json 이 없어 잡힌다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
+    caller = _FakeCaller([VALID_SUMMARY_TEXT])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+    sender = _FakeSender([204])
+    monkeypatch.setattr(watcher, "make_discord_sender", sender.factory)
+
+    run_session(config, paths, selection, lambda line: None, WITH_DISCORD)
+
+    assert len(sender.payloads) == 1
+    redaction = json.loads(paths.redaction_json.read_text(encoding="utf-8"))
+    assert redaction["policy"] == "clean"
+    assert redaction["secrets_found"] == 0
+    assert redaction["findings"] == []
+    assert _session_doc(paths)["redaction"] == {
+        "secrets_found": 0,
+        "by_rule": {},
+        "paths_relativized": True,
+    }
+
+
 # ── 순수 판정 함수 — summary_state 환원과 종료 매핑 표 전수 (설계 6.6, 기준 21) ──
 
 
@@ -1258,10 +1745,29 @@ def test_resolve_summary_state_covers_all_branches() -> None:
     assert resolve_summary_state(ok, attempted=True, dry_run=False) == "ok"
 
 
+def _delivered(status: int) -> DeliveryOutcome:
+    return DeliveryOutcome(
+        delivered=True, requests=1, chunks=1, http_status=status, error=None, skip_reason=None
+    )
+
+
+def _delivery_failed(error: str, http_status: int | None = None) -> DeliveryOutcome:
+    return DeliveryOutcome(
+        delivered=False,
+        requests=0,
+        chunks=1,
+        http_status=http_status,
+        error=error,
+        skip_reason=None,
+    )
+
+
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     [
-        # 설계 6.6 매핑 표 전 행. 종료 코드는 아래 run_watch 매핑 테스트가 고정한다.
+        # 4단계 설계 6.6 + 5단계 설계 5.6 매핑 표 전 행. 앞쪽 4단계 행이 그대로 남아
+        # 있는 것 자체가 판정 1번(전송 배선이 기존 판정을 바꾸지 않는다)의 회귀 그물이다.
+        # 종료 코드는 아래 run_watch 매핑 테스트가 고정한다.
         ({"no_change": True}, (SessionStatus.COMPLETED, None)),
         ({"secrets_blocked": True}, (SessionStatus.FAILED, "secrets_detected")),
         ({"diff_failed": True}, (SessionStatus.PARTIAL, "diff_failed")),
@@ -1277,18 +1783,80 @@ def test_resolve_summary_state_covers_all_branches() -> None:
         ),
         ({"summary_state": "ok", "no_discord": True}, (SessionStatus.COMPLETED, None)),
         ({"summary_state": "fallback", "no_discord": True}, (SessionStatus.COMPLETED, None)),
+        # 전송 판정 지점에 도달하지 못한 경우(abort 등). 정상 경로에는 없다 (설계 4.1).
         (
             {"summary_state": "ok"},
-            (SessionStatus.PARTIAL, "discord_pipeline_not_implemented"),
+            (SessionStatus.PARTIAL, notify.ERROR_DISCORD_NOT_ATTEMPTED),
         ),
         (
             {"summary_state": "fallback"},
-            (SessionStatus.PARTIAL, "discord_pipeline_not_implemented"),
+            (SessionStatus.PARTIAL, notify.ERROR_DISCORD_NOT_ATTEMPTED),
         ),
         # 우선순위: 차단이 요약 실패보다 앞선다.
         (
             {"secrets_blocked": True, "summary_state": "failed", "summary_error": "openai_timeout"},
             (SessionStatus.FAILED, "secrets_detected"),
+        ),
+        # ── 5단계 설계 5.6: 전송 결과가 마지막 한 줄을 정한다 ──────────────────
+        ({"summary_state": "ok", "discord": _delivered(204)}, (SessionStatus.COMPLETED, None)),
+        (
+            {"summary_state": "fallback", "discord": _delivered(200)},
+            (SessionStatus.COMPLETED, None),
+        ),
+        (
+            {"summary_state": "ok", "discord": _delivery_failed("discord_url_missing")},
+            (SessionStatus.PARTIAL, "discord_url_missing"),
+        ),
+        (
+            {"summary_state": "ok", "discord": _delivery_failed("discord_http_404", 404)},
+            (SessionStatus.PARTIAL, "discord_http_404"),
+        ),
+        (
+            {"summary_state": "ok", "discord": _delivery_failed("discord_http_503", 503)},
+            (SessionStatus.PARTIAL, "discord_http_503"),
+        ),
+        (
+            {"summary_state": "ok", "discord": _delivery_failed("discord_timeout")},
+            (SessionStatus.PARTIAL, "discord_timeout"),
+        ),
+        (
+            {"summary_state": "ok", "discord": _delivery_failed("discord_connection")},
+            (SessionStatus.PARTIAL, "discord_connection"),
+        ),
+        # 생략 5갈래는 전부 앞쪽 분기가 먼저 잡는다 — 전송 결과를 넘겨도 값이 안 바뀐다.
+        (
+            {
+                "summary_state": "ok",
+                "no_discord": True,
+                "discord": notify.skipped_delivery(notify.SKIP_NO_DISCORD),
+            },
+            (SessionStatus.COMPLETED, None),
+        ),
+        (
+            {"no_change": True, "discord": notify.skipped_delivery(notify.SKIP_NO_CHANGE)},
+            (SessionStatus.COMPLETED, None),
+        ),
+        (
+            {
+                "secrets_blocked": True,
+                "discord": notify.skipped_delivery(notify.SKIP_SECRETS_BLOCKED),
+            },
+            (SessionStatus.FAILED, "secrets_detected"),
+        ),
+        (
+            {
+                "summary_state": "dry_run",
+                "discord": notify.skipped_delivery(notify.SKIP_DRY_RUN),
+            },
+            (SessionStatus.COMPLETED, None),
+        ),
+        (
+            {
+                "summary_state": "failed",
+                "summary_error": "openai_timeout",
+                "discord": notify.skipped_delivery(notify.SKIP_NO_SUMMARY),
+            },
+            (SessionStatus.PARTIAL, "openai_timeout"),
         ),
     ],
 )
@@ -1303,6 +1871,7 @@ def test_resolve_session_end_matches_design_table(
         "summary_state": "not_run",
         "summary_error": None,
         "no_discord": False,
+        "discord": None,
     }
     params.update(overrides)
     assert resolve_session_end(**params) == expected  # type: ignore[arg-type]
@@ -1312,18 +1881,60 @@ def test_resolve_session_end_matches_design_table(
 
 
 @pytest.mark.parametrize(
-    ("summary_state", "no_discord", "expected_rc", "snippet"),
+    ("summary_state", "no_discord", "discord_state", "expected_rc", "snippet"),
     [
-        (watcher.SUMMARY_DRY_RUN, False, cli.EXIT_OK, "[DONE] dry-run"),
-        (watcher.SUMMARY_NOT_RUN, False, cli.EXIT_RUNTIME, "요약 단계까지 진행하지 못했습니다"),
-        (watcher.SUMMARY_FAILED, False, cli.EXIT_RUNTIME, "요약을 만들지 못했습니다"),
-        (watcher.SUMMARY_OK, True, cli.EXIT_OK, "전송은 생략합니다"),
-        (watcher.SUMMARY_FALLBACK, True, cli.EXIT_OK, "규칙 기반 요약을 저장했습니다"),
+        (watcher.SUMMARY_DRY_RUN, False, notify.DISCORD_SKIPPED, cli.EXIT_OK, "[DONE] dry-run"),
+        (
+            watcher.SUMMARY_NOT_RUN,
+            False,
+            notify.DISCORD_SKIPPED,
+            cli.EXIT_RUNTIME,
+            "요약 단계까지 진행하지 못했습니다",
+        ),
+        (
+            watcher.SUMMARY_FAILED,
+            False,
+            notify.DISCORD_SKIPPED,
+            cli.EXIT_RUNTIME,
+            "요약을 만들지 못했습니다",
+        ),
+        (watcher.SUMMARY_OK, True, notify.DISCORD_SKIPPED, cli.EXIT_OK, "전송은 생략합니다"),
+        (
+            watcher.SUMMARY_FALLBACK,
+            True,
+            notify.DISCORD_SKIPPED,
+            cli.EXIT_OK,
+            "규칙 기반 요약을 저장했습니다",
+        ),
+        # ── 5단계: 전송 결과가 마지막 두 갈래를 정한다 (설계 5.6) ──────────────
         (
             watcher.SUMMARY_OK,
             False,
+            notify.DISCORD_SENT,
+            cli.EXIT_OK,
+            "[DONE] 요약과 Discord 전송을 완료했습니다",
+        ),
+        (
+            watcher.SUMMARY_FALLBACK,
+            False,
+            notify.DISCORD_SENT,
+            cli.EXIT_OK,
+            "[DONE] 요약과 Discord 전송을 완료했습니다",
+        ),
+        (
+            watcher.SUMMARY_OK,
+            False,
+            notify.DISCORD_FAILED,
             cli.EXIT_RUNTIME,
-            "Discord 전송 단계는 아직 구현되지 않았습니다",
+            "[FAILED] Discord 전송에 실패했습니다.",
+        ),
+        # 전송 판정 지점에 도달하지 못한 세션도 성공으로 보지 않는다.
+        (
+            watcher.SUMMARY_OK,
+            False,
+            notify.DISCORD_NOT_RUN,
+            cli.EXIT_RUNTIME,
+            "[FAILED] Discord 전송에 실패했습니다.",
         ),
     ],
 )
@@ -1333,6 +1944,7 @@ def test_run_watch_maps_summary_state_to_exit_code(
     capsys: pytest.CaptureFixture[str],
     summary_state: str,
     no_discord: bool,
+    discord_state: str,
     expected_rc: int,
     snippet: str,
 ) -> None:
@@ -1345,6 +1957,7 @@ def test_run_watch_maps_summary_state_to_exit_code(
         aborted=False,
         secrets_blocked=False,
         summary_state=summary_state,
+        discord_state=discord_state,
     )
 
     def fake_run_session(

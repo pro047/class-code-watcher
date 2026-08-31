@@ -36,7 +36,30 @@ from .diffgen import (
     render_final_diff,
     watched_file_entries,
 )
+from .discord_client import make_discord_sender
 from .eventlog import append_jsonl, event_row
+from .notify import (
+    DISCORD_NOT_RUN,
+    ERROR_DISCORD_NOT_ATTEMPTED,
+    ERROR_DISCORD_PAYLOAD_FAILED,
+    ERROR_DISCORD_URL_MISSING,
+    SKIP_DRY_RUN,
+    SKIP_NO_CHANGE,
+    SKIP_NO_DISCORD,
+    SKIP_NO_SUMMARY,
+    SKIP_SECRETS_BLOCKED,
+    DeliveryOutcome,
+    build_render_input,
+    deliver,
+    failed_delivery,
+    payload_doc,
+    plan_message,
+    render_stats_only,
+    resolve_discord_state,
+    session_discord_fields,
+    skipped_delivery,
+    write_payload_json,
+)
 from .openai_client import DEFAULT_OPENAI_MODEL, make_openai_caller
 from .redact import (
     ERROR_SECRETS_DETECTED,
@@ -78,8 +101,6 @@ STATUS_DELETED = "deleted"
 # 중단된 세션 전용. baseline↔final 비교를 못 했으므로 어느 상태도 주장하지 않는다.
 STATUS_UNKNOWN = "unknown"
 
-# 요약까지 끝났지만 Discord 전송(5단계)이 아직 없는 세션의 종료 사유. 5단계가 이 자리를 가져간다.
-ERROR_DISCORD_PENDING = "discord_pipeline_not_implemented"
 # diff 를 못 만들어 정제·요약에 넘길 것이 없는 세션.
 ERROR_DIFF_FAILED = "diff_failed"
 # 정제 산출물을 못 써서 스캔 통과를 주장할 수 없는 세션.
@@ -108,6 +129,7 @@ class WatchOutcome:
     # 비밀값 탐지로 외부 전송을 중단한 세션 (FR-036). 종료 코드는 1 그대로다.
     secrets_blocked: bool = False
     summary_state: str = SUMMARY_NOT_RUN
+    discord_state: str = DISCORD_NOT_RUN
 
 
 def compute_statuses(
@@ -170,6 +192,7 @@ def resolve_session_end(
     summary_state: str,
     summary_error: str | None,
     no_discord: bool,
+    discord: DeliveryOutcome | None = None,
 ) -> tuple[SessionStatus, str | None]:
     """순수 — 세션 종료 status·error 판정 (PRD 12절 표).
 
@@ -191,7 +214,14 @@ def resolve_session_end(
     if summary_state in (SUMMARY_OK, SUMMARY_FALLBACK) and no_discord:
         # 사용자가 전송 생략을 명시했으므로 이 설정에서 할 일이 전부 끝났다 (PRD 10.2).
         return SessionStatus.COMPLETED, None
-    return SessionStatus.PARTIAL, ERROR_DISCORD_PENDING
+    if discord is not None and discord.delivered:
+        return SessionStatus.COMPLETED, None
+    if discord is not None and discord.error is not None:
+        # 4xx/5xx/timeout/연결 실패를 error 값으로 가른다. 종료 코드는 PRD 10.3 의 4종
+        # 제약 때문에 전부 1이고, 구분은 session.json 이 한다 (C-10).
+        return SessionStatus.PARTIAL, discord.error
+    # 전송 판정 지점에 도달하지 못했다. 5갈래 생략은 위 분기가 이미 잡으므로 정상 경로에는 없다.
+    return SessionStatus.PARTIAL, ERROR_DISCORD_NOT_ATTEMPTED
 
 
 def _drive_type_of(drive_root: str) -> int:
@@ -538,6 +568,105 @@ def _run_summarize(
     return outcome
 
 
+def _change_stats_of(
+    diff_result: DiffResult | None, statuses: Mapping[str, str], event_count: int
+) -> dict[str, object]:
+    """session.json 과 콘솔이 같은 수치를 말하도록 계산을 한 곳에 모은다.
+
+    diff 를 못 돌린 세션(no_change 또는 생성 실패)은 라인 수를 주장하지 않는다.
+    """
+    if diff_result is None:
+        changed = sum(1 for status in statuses.values() if status != STATUS_UNCHANGED)
+        return {"files_changed": changed, "events": event_count}
+    return change_stats_fields(diff_result, event_count)
+
+
+def _stat_int(stats: Mapping[str, object], key: str) -> int:
+    value = stats.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _run_notify(
+    state: "_Session",
+    outcome: SummarizeOutcome | None,
+    *,
+    change_stats: Mapping[str, object],
+    ended_at: str,
+    no_change: bool,
+    secrets_blocked: bool,
+) -> DeliveryOutcome:
+    """Discord 전송 지점 (FR-033/034/050~052). 판정은 전부 notify.py 순수 함수가 한다.
+
+    렌더러에는 summary.json 의 doc 만 넘어간다 — final.diff·정제본을 다시 읽는 경로를
+    만들지 않는다 (FR-051). 전송이 아예 일어나지 않는 5갈래는 여기서 갈리고, 그중 넷은
+    콘솔 출력도 기존 문구를 그대로 쓴다.
+    """
+    if no_change:
+        return skipped_delivery(SKIP_NO_CHANGE)
+    if secrets_blocked:
+        return skipped_delivery(SKIP_SECRETS_BLOCKED)
+    if state.config.dry_run:
+        return skipped_delivery(SKIP_DRY_RUN)
+
+    started_at = str(state.doc.get("started_at", ""))
+    doc = outcome.doc if outcome is not None else None
+    render_input = (
+        build_render_input(
+            doc, title_fallback=state.config.title, started_at=started_at, ended_at=ended_at
+        )
+        if doc is not None
+        else None
+    )
+    if render_input is None:
+        # 보낼 내용이 없는데 알림을 쓰는 것은 FR-052 와 어긋난다. 실행자에게는 통계만 보인다.
+        state.emit(
+            render_stats_only(
+                title=state.config.title,
+                started_at=started_at,
+                ended_at=ended_at,
+                files_changed=_stat_int(change_stats, "files_changed"),
+                added_lines=_stat_int(change_stats, "added_lines"),
+                deleted_lines=_stat_int(change_stats, "deleted_lines"),
+                session_root=str(state.paths.root),
+                reason=(outcome.error if outcome is not None and outcome.error else "요약 없음"),
+            )
+        )
+        return skipped_delivery(SKIP_NO_SUMMARY)
+
+    plan = plan_message(render_input)
+    # 전송 성공·실패·--no-discord 를 가리지 않고 항상 낸다. 분기가 하나면 실행자가 요약을
+    # 볼 경로도, E2E 가 webhook 없이 렌더링을 검증할 경로도 같아진다.
+    state.emit(plan.text)
+    try:
+        write_payload_json(
+            state.paths.discord_payload_json,
+            payload_doc(plan, generated_at=datetime.now().astimezone().isoformat()),
+        )
+    except OSError as exc:
+        _stage_error(state, "notify", exc)
+        # 로컬 보존이 성립하지 않는 상태로 외부에 나가지 않는다 (PRD 12절 복구 원칙).
+        state.emit("[WARN] 전송할 내용을 저장하지 못했습니다. 외부 전송은 하지 않습니다.")
+        return failed_delivery(ERROR_DISCORD_PAYLOAD_FAILED)
+
+    if state.config.no_discord:
+        return skipped_delivery(SKIP_NO_DISCORD)
+    webhook_url = state.secrets.discord_webhook_url
+    if not webhook_url:
+        # --no-discord 를 안 준 사용자는 전송을 기대했다. 생략이 아니라 실패다.
+        state.emit("[FAILED] DISCORD_WEBHOOK_URL 이 없습니다. .env 를 확인하세요.")
+        return failed_delivery(ERROR_DISCORD_URL_MISSING)
+
+    state.emit(f"[DISCORD] 요약을 전송합니다 ({len(plan.chunks)}개 메시지)")
+    result = deliver(plan, make_discord_sender(webhook_url))
+    if result.delivered:
+        state.emit(f"[DISCORD] 전송 완료 (HTTP {result.http_status})")
+    else:
+        # 메시지에 URL 을 넣지 않는 것이 1차, emit 뒤의 mask_secrets 가 2차다.
+        state.emit(f"[WARN] Discord 전송에 실패했습니다 (사유: {result.error}).")
+        state.emit(f"       전송할 내용은 남아 있습니다: {state.paths.discord_payload_json}")
+    return result
+
+
 def _drain_queue(sink: "queue.Queue[RawEvent]", debouncer: Debouncer) -> None:
     """큐를 짧게 기다렸다가 쌓인 것을 한 번에 흡수한다."""
     deadline = debouncer.next_deadline()
@@ -620,6 +749,7 @@ def _finalize(
     redaction: RedactionResult | None = None
     summarize: SummarizeOutcome | None = None
     summarize_attempted = False
+    discord: DeliveryOutcome | None = None
     # stats.json 과 session.json 이 서로 다른 시각을 말하면 같은 세션으로 안 보인다.
     ended_at: str | None = None
     try:
@@ -664,6 +794,16 @@ def _finalize(
                     summarize = _run_summarize(
                         state, redaction.text, diff_result, ended_at
                     )
+        # 전송도 같은 try 안이다 — 두 번째 Ctrl+C 는 abort 분기로 흐르고 이미 쓴
+        # discord_payload.json 은 남는다 (PRD 12절).
+        discord = _run_notify(
+            state,
+            summarize,
+            change_stats=_change_stats_of(diff_result, statuses, state.event_count),
+            ended_at=ended_at,
+            no_change=is_no_change(statuses),
+            secrets_blocked=redaction is not None and redaction.blocked,
+        )
     except KeyboardInterrupt:
         aborted = True
 
@@ -675,6 +815,7 @@ def _finalize(
             ended_at=ended_at,
             error=ABORTED_ERROR,
             watched_files=unknown_file_statuses(state.selection.selected),
+            discord=session_discord_fields(discord),
         )
         state.emit("[ABORTED] 두 번째 종료 요청. 지금까지의 산출물만 남깁니다.")
         return WatchOutcome(
@@ -686,27 +827,22 @@ def _finalize(
         )
 
     no_change = is_no_change(statuses)
-    changed = sum(1 for status in statuses.values() if status != STATUS_UNCHANGED)
     if diff_result is None:
-        # diff 를 못 돌린 세션(no_change 또는 생성 실패)은 라인 수를 주장하지 않는다.
         watched_files: list[dict[str, str]] = [
             {"path": rel, "status": status} for rel, status in statuses.items()
         ]
-        change_stats: dict[str, object] = {
-            "files_changed": changed,
-            "events": state.event_count,
-        }
     else:
         watched_files = watched_file_entries(statuses, diff_result)
-        change_stats = change_stats_fields(diff_result, state.event_count)
     fields: dict[str, object] = {
         "ended_at": ended_at,
         "watched_files": watched_files,
-        "change_stats": change_stats,
+        "change_stats": _change_stats_of(diff_result, statuses, state.event_count),
         "no_change": no_change,
         # 호출이 없던 세션도 calls: 0 으로 남긴다 — "호출 0회"를 사후에 증명할 수 있어야
         # 준수율 집계(PRD 15절)가 전 세션에서 성립한다 (FR-030, FR-035).
         "openai": session_openai_fields(summarize),
+        # 전송 0회도 계수로 남긴다 — 같은 논리다 (FR-035, FR-052).
+        "discord": session_discord_fields(discord),
     }
     if state.config.dry_run:
         fields["dry_run"] = True
@@ -724,6 +860,7 @@ def _finalize(
         summary_state=summary_state,
         summary_error=summarize.error if summarize is not None else None,
         no_discord=state.config.no_discord,
+        discord=discord,
     )
     if error is None:
         state.write_status(status, **fields)
@@ -738,6 +875,7 @@ def _finalize(
         aborted=False,
         secrets_blocked=secrets_blocked,
         summary_state=summary_state,
+        discord_state=resolve_discord_state(discord),
     )
 
 

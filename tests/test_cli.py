@@ -4,22 +4,51 @@ import argparse
 import json
 import re
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from class_watcher import cli, watcher
+from class_watcher import cli, notify, watcher
 from class_watcher.config import (
     DEFAULT_EXCLUDE,
     DEFAULT_INCLUDE,
     Secrets,
 )
 from class_watcher.debounce import Debouncer, RawEvent
+from class_watcher.notify import DiscordRequestError
+from class_watcher.summarize import BuiltPrompt, LlmResponse
 
 NOW = datetime(2026, 8, 26, 18, 30, 0)
 FAKE_OPENAI_KEY = "sk-test-abcdef1234567890"
+# 실제 Discord 도메인이 아니다. 이 값이 콘솔·산출물로 새는지를 보는 표식이다.
+FAKE_WEBHOOK = "https://discord.example/api/webhooks/1234567890/super-secret-token"
+
+# tests/ 에 conftest.py 를 두지 않는다(파이프라인이 설정 파일 신설을 금지한다). 그래서
+# 4단계 fixture 를 test_watcher.py 와 같은 내용으로 여기에도 둔다. 한글·ASCII 뿐이라
+# cp949 안전하다 — 이모지를 넣으면 아래 cp949 회귀 단언이 깨진다.
+VALID_SUMMARY_TEXT = json.dumps(
+    {
+        "session_title": "검증",
+        "summary": "값을 바꾸는 변경을 했다.",
+        "change_stats": {"files_changed": 1, "added_lines": 1, "deleted_lines": 1},
+        "changes": [
+            {
+                "file": "file0.py",
+                "area": "핵심",
+                "type": "modified",
+                "description": "변수 값을 바꾸는 코드",
+                "evidence": "x = 2",
+            }
+        ],
+        "learning_points": [],
+        "questions_to_review": [],
+        "risks_or_todos": [],
+        "sensitive_data_detected": False,
+    },
+    ensure_ascii=False,
+)
 
 
 def _parse(*argv: str) -> argparse.Namespace:
@@ -440,17 +469,18 @@ def test_full_run_never_touches_network(
     capsys.readouterr()
 
 
-def test_network_client_imports_only_in_designated_adapter() -> None:
-    """구조적 보장: 네트워크 클라이언트 import 는 어댑터(openai_client.py) 한 곳뿐이다.
+def test_network_client_imports_only_in_designated_adapters() -> None:
+    """구조적 보장: 네트워크 클라이언트 import 는 지정된 어댑터 2개뿐이다.
 
-    설계 3.3 이 외부 API 표면을 openai_client.py 하나에 격리했다. 다른 모듈이 SDK 를
-    직접 import 하기 시작하면 FR-030 의 호출 계수가 mock 경계(CallFn) 밖으로 샌다.
+    4단계 설계 3.3 이 OpenAI 표면을 openai_client.py 에, 5단계 설계 4.2 가 Discord 표면을
+    discord_client.py 에 격리했다. 다른 모듈이 SDK·HTTP 클라이언트를 직접 import 하기
+    시작하면 FR-030/FR-035 의 호출 계수가 mock 경계(CallFn·SendFn) 밖으로 샌다.
     """
     package_dir = Path(cli.__file__).resolve().parent
     banned = ("openai", "httpx", "requests", "aiohttp", "urllib", "socket", "http")
-    adapter = "openai_client.py"
+    adapters = ("openai_client.py", "discord_client.py")
     for module_path in sorted(package_dir.glob("*.py")):
-        if module_path.name == adapter:
+        if module_path.name in adapters:
             continue
         source = module_path.read_text(encoding="utf-8")
         for name in banned:
@@ -458,8 +488,345 @@ def test_network_client_imports_only_in_designated_adapter() -> None:
             assert f"from {name} import" not in source, (
                 f"{module_path.name} 이 {name} 을 import 한다"
             )
-    # 어댑터 자신은 openai 만 쓴다 — httpx 등 다른 클라이언트를 늘리지 않는다.
-    adapter_source = (package_dir / adapter).read_text(encoding="utf-8")
-    assert "from openai import" in adapter_source
+    # 각 어댑터는 자기 클라이언트 하나만 쓴다 — 표면이 섞이면 격리가 무의미해진다.
+    openai_source = (package_dir / "openai_client.py").read_text(encoding="utf-8")
+    assert "from openai import" in openai_source
     for name in ("httpx", "requests", "aiohttp", "socket"):
-        assert f"import {name}" not in adapter_source
+        assert f"import {name}" not in openai_source
+    discord_source = (package_dir / "discord_client.py").read_text(encoding="utf-8")
+    assert "import httpx" in discord_source
+    for name in ("openai", "requests", "aiohttp", "socket"):
+        assert f"import {name}" not in discord_source
+    # httpx 를 import 하는 파일은 discord_client.py 하나뿐이다 (IMPL 4.1 ①).
+    httpx_importers = [
+        module_path.name
+        for module_path in sorted(package_dir.glob("*.py"))
+        if "import httpx" in module_path.read_text(encoding="utf-8")
+    ]
+    assert httpx_importers == ["discord_client.py"]
+
+
+# ── 5단계 전송: 종료 코드 매핑·실패 안내·정리 안내·마스킹 (케이스 33~36) ──────
+#
+# main() 전체를 돌리되 두 어댑터 팩토리를 갈아끼운다 — 네트워크는 나가지 않는다.
+
+
+def _patch_summary(monkeypatch: pytest.MonkeyPatch, text: str) -> list[BuiltPrompt]:
+    prompts: list[BuiltPrompt] = []
+
+    def call(prompt: BuiltPrompt) -> LlmResponse:
+        prompts.append(prompt)
+        return LlmResponse(text=text, request_id="req-1", model="fake-model")
+
+    def factory(api_key: str, model: str) -> Callable[[BuiltPrompt], LlmResponse]:
+        return call
+
+    monkeypatch.setattr(watcher, "make_openai_caller", factory)
+    return prompts
+
+
+def _patch_sender(
+    monkeypatch: pytest.MonkeyPatch, outcomes: list[int | DiscordRequestError]
+) -> list[dict[str, object]]:
+    remaining = list(outcomes)
+    sent: list[dict[str, object]] = []
+
+    def send(payload: Mapping[str, object]) -> int:
+        sent.append(dict(payload))
+        outcome = remaining.pop(0)
+        if isinstance(outcome, DiscordRequestError):
+            raise outcome
+        return outcome
+
+    def factory(webhook_url: str) -> Callable[[Mapping[str, object]], int]:
+        return send
+
+    monkeypatch.setattr(watcher, "make_discord_sender", factory)
+    return sent
+
+
+def _forbid_sender(monkeypatch: pytest.MonkeyPatch) -> None:
+    def factory(webhook_url: str) -> Callable[[Mapping[str, object]], int]:
+        raise AssertionError("이 경로는 Discord 전송 함수를 만들면 안 된다 (FR-035/FR-052)")
+
+    monkeypatch.setattr(watcher, "make_discord_sender", factory)
+
+
+def _change_file0(tree: Path) -> Callable[[Debouncer], None]:
+    def change(debouncer: Debouncer) -> None:
+        (tree / "file0.py").write_text("# changed\n", encoding="utf-8")
+        debouncer.observe(RawEvent(rel_path="file0.py", kind="modified", at=0.0))
+
+    return change
+
+
+def test_main_successful_delivery_exits_zero(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 케이스 33 (PRD 10.3): 전송 성공은 completed / 코드 0 이다.
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_OPENAI_KEY)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", FAKE_WEBHOOK)
+    tree = _make_tree(isolated_env, count=1)
+    sessions = isolated_env / "sessions"
+    _interrupt_after(monkeypatch, [_change_file0(tree)])
+    _patch_summary(monkeypatch, VALID_SUMMARY_TEXT)
+    sent = _patch_sender(monkeypatch, [204])
+
+    rc = cli.main(["watch", str(tree), "--session-dir", str(sessions)])
+
+    assert rc == cli.EXIT_OK
+    assert len(sent) == 1
+    [root] = list(sessions.iterdir())
+    doc = json.loads((root / "session.json").read_text(encoding="utf-8"))
+    assert doc["status"] == "completed"
+    assert "error" not in doc
+    assert doc["discord"] == {
+        "delivered": True,
+        "http_status": 204,
+        "requests": 1,
+        "chunks": 1,
+        "skip_reason": None,
+    }
+    captured = capsys.readouterr()
+    assert "[DONE] 요약과 Discord 전송을 완료했습니다" in captured.out
+    captured.out.encode("cp949")
+    captured.err.encode("cp949")
+
+
+def test_main_delivery_failure_points_at_the_payload_file(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 케이스 34 (FR-034): 전송 실패는 코드 1 이고, 콘솔이 수동 복사 경로를 알려 준다.
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_OPENAI_KEY)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", FAKE_WEBHOOK)
+    tree = _make_tree(isolated_env, count=1)
+    sessions = isolated_env / "sessions"
+    _interrupt_after(monkeypatch, [_change_file0(tree)])
+    _patch_summary(monkeypatch, VALID_SUMMARY_TEXT)
+    _patch_sender(monkeypatch, [DiscordRequestError(notify.KIND_HTTP, http_status=503)])
+
+    rc = cli.main(["watch", str(tree), "--session-dir", str(sessions)])
+
+    assert rc == cli.EXIT_RUNTIME
+    [root] = list(sessions.iterdir())
+    doc = json.loads((root / "session.json").read_text(encoding="utf-8"))
+    assert doc["status"] == "partial"
+    assert doc["error"] == "discord_http_503"
+    assert (root / "discord_payload.json").is_file()
+    captured = capsys.readouterr()
+    assert "[FAILED] Discord 전송에 실패했습니다." in captured.err
+    assert str(root / "discord_payload.json") in captured.err
+    assert "session.json" in captured.err
+    captured.err.encode("cp949")
+
+
+def test_main_missing_webhook_url_is_a_failure_not_a_skip(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 케이스 33 (설계 5.6): --no-discord 를 안 준 사용자는 전송을 기대했다. 생략이 아니다.
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_OPENAI_KEY)
+    tree = _make_tree(isolated_env, count=1)
+    sessions = isolated_env / "sessions"
+    _interrupt_after(monkeypatch, [_change_file0(tree)])
+    _patch_summary(monkeypatch, VALID_SUMMARY_TEXT)
+    _forbid_sender(monkeypatch)
+
+    rc = cli.main(["watch", str(tree), "--session-dir", str(sessions)])
+
+    assert rc == cli.EXIT_RUNTIME
+    [root] = list(sessions.iterdir())
+    doc = json.loads((root / "session.json").read_text(encoding="utf-8"))
+    assert doc["status"] == "partial"
+    assert doc["error"] == "discord_url_missing"
+    assert capsys.readouterr().err.count("[FAILED]") >= 1
+
+
+def test_main_no_discord_option_exits_zero_without_sending(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 케이스 33 (PRD 10.2): --no-discord 는 성공적 생략이다 — 전송 0회, 코드 0.
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_OPENAI_KEY)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", FAKE_WEBHOOK)
+    tree = _make_tree(isolated_env, count=1)
+    sessions = isolated_env / "sessions"
+    _interrupt_after(monkeypatch, [_change_file0(tree)])
+    _patch_summary(monkeypatch, VALID_SUMMARY_TEXT)
+    _forbid_sender(monkeypatch)
+
+    rc = cli.main(["watch", str(tree), "--no-discord", "--session-dir", str(sessions)])
+
+    assert rc == cli.EXIT_OK
+    [root] = list(sessions.iterdir())
+    doc = json.loads((root / "session.json").read_text(encoding="utf-8"))
+    assert doc["status"] == "completed"
+    assert doc["discord"]["skip_reason"] == notify.SKIP_NO_DISCORD
+    assert doc["discord"]["requests"] == 0
+    captured = capsys.readouterr()
+    assert "전송은 생략합니다" in captured.out
+    captured.out.encode("cp949")
+
+
+def test_main_dry_run_exits_zero_without_sending(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 케이스 33: dry-run 도 전송 0회 / 코드 0 이다. "요약 없음"과 다른 분기다.
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_OPENAI_KEY)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", FAKE_WEBHOOK)
+    tree = _make_tree(isolated_env, count=1)
+    sessions = isolated_env / "sessions"
+    _interrupt_after(monkeypatch, [_change_file0(tree)])
+    _forbid_sender(monkeypatch)
+
+    rc = cli.main(["watch", str(tree), "--dry-run", "--session-dir", str(sessions)])
+
+    assert rc == cli.EXIT_OK
+    [root] = list(sessions.iterdir())
+    doc = json.loads((root / "session.json").read_text(encoding="utf-8"))
+    assert doc["status"] == "completed"
+    assert doc["discord"]["skip_reason"] == notify.SKIP_DRY_RUN
+    assert not (root / "discord_payload.json").exists()
+    capsys.readouterr()
+
+
+def test_main_second_ctrl_c_exits_one_thirty(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 케이스 33 (PRD 10.3): 두 번째 Ctrl+C 는 130. 전송 배선이 이 값을 바꾸지 않는다.
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_OPENAI_KEY)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", FAKE_WEBHOOK)
+    tree = _make_tree(isolated_env, count=1)
+    sessions = isolated_env / "sessions"
+
+    def second_ctrl_c(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    _interrupt_after(monkeypatch, [_change_file0(tree)])
+    monkeypatch.setattr(watcher, "wait_for_stability", second_ctrl_c)
+    _forbid_sender(monkeypatch)
+
+    rc = cli.main(["watch", str(tree), "--session-dir", str(sessions)])
+
+    assert rc == cli.EXIT_ABORTED
+    [root] = list(sessions.iterdir())
+    doc = json.loads((root / "session.json").read_text(encoding="utf-8"))
+    assert doc["status"] == "failed"
+    assert doc["discord"]["requests"] == 0
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize(
+    ("argv_extra", "planted", "expected_rc"),
+    [
+        # 케이스 35: 세션 디렉터리가 만들어진 모든 종료 경로에서 마지막에 나온다.
+        ((), None, cli.EXIT_OK),  # 변경 없음
+        (("--no-discord",), "# changed\n", cli.EXIT_OK),  # 요약 성공 + 전송 생략
+        ((), "# sk-fixture0123456789abcdefgh\n", cli.EXIT_RUNTIME),  # 비밀값 차단
+    ],
+)
+def test_cleanup_notice_closes_every_session_path(
+    isolated_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv_extra: tuple[str, ...],
+    planted: str | None,
+    expected_rc: int,
+) -> None:
+    # FR-053: 공용 PC 정리 안내. run_watch 의 return 지점이 9개라 main 의 finally 에
+    # 한 번만 붙인다 — 한 곳을 빠뜨리면 P1 요구사항이 조용히 새는 형태가 된다.
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_OPENAI_KEY)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", FAKE_WEBHOOK)
+    tree = _make_tree(isolated_env, count=1)
+    sessions = isolated_env / "sessions"
+    steps: list[Callable[[Debouncer], None]] = []
+    if planted is not None:
+        content = planted
+
+        def change(debouncer: Debouncer) -> None:
+            (tree / "file0.py").write_text(content, encoding="utf-8")
+            debouncer.observe(RawEvent(rel_path="file0.py", kind="modified", at=0.0))
+
+        steps.append(change)
+    _interrupt_after(monkeypatch, steps)
+    _patch_summary(monkeypatch, VALID_SUMMARY_TEXT)
+    _forbid_sender(monkeypatch)
+
+    rc = cli.main(["watch", str(tree), *argv_extra, "--session-dir", str(sessions)])
+
+    assert rc == expected_rc
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert lines[-4].startswith("[정리 안내]")
+    tail = "\n".join(lines[-4:])
+    [root] = list(sessions.iterdir())
+    assert str(root) in tail
+    assert "OPENAI_API_KEY" in tail
+    assert "DISCORD_WEBHOOK_URL" in tail
+    # 값·존재 여부는 찍지 않는다 (FR-003).
+    assert FAKE_OPENAI_KEY not in captured.out
+    assert FAKE_WEBHOOK not in captured.out
+    captured.out.encode("cp949")
+
+
+def test_cleanup_notice_closes_the_delivery_failure_path(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 케이스 35 의 나머지 한 갈래 — 위 parametrize 는 전송을 금지하므로 실패 경로를
+    # 못 탄다. 안내는 종료 코드와 무관하게 나와야 한다 (설계 5.9).
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_OPENAI_KEY)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", FAKE_WEBHOOK)
+    tree = _make_tree(isolated_env, count=1)
+    sessions = isolated_env / "sessions"
+    _interrupt_after(monkeypatch, [_change_file0(tree)])
+    _patch_summary(monkeypatch, VALID_SUMMARY_TEXT)
+    _patch_sender(monkeypatch, [DiscordRequestError(notify.KIND_HTTP, http_status=500)])
+
+    rc = cli.main(["watch", str(tree), "--session-dir", str(sessions)])
+
+    assert rc == cli.EXIT_RUNTIME
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert lines[-4].startswith("[정리 안내]")
+    [root] = list(sessions.iterdir())
+    assert str(root) in "\n".join(lines[-4:])
+    assert FAKE_WEBHOOK not in captured.out
+
+
+def test_cleanup_notice_is_absent_when_no_session_was_created(
+    isolated_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 안내할 산출물이 없으면 안내하지 않는다 (설계 5.9).
+    rc = cli.main(["watch", str(isolated_env / "없는-경로")])
+
+    assert rc == cli.EXIT_CONFIG
+    captured = capsys.readouterr()
+    assert "[정리 안내]" not in captured.out + captured.err
+
+
+def test_webhook_url_never_appears_in_any_output_or_artifact(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 케이스 36 (FR-003, FR-042): Webhook URL 은 비밀값이다(PRD 13.1). 전송 실패 세션은
+    # httpx 예외 메시지가 URL 을 물고 올라올 수 있는 유일한 경로라 여기서 본다.
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_OPENAI_KEY)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", FAKE_WEBHOOK)
+    tree = _make_tree(isolated_env, count=1)
+    sessions = isolated_env / "sessions"
+    _interrupt_after(monkeypatch, [_change_file0(tree)])
+    _patch_summary(monkeypatch, VALID_SUMMARY_TEXT)
+    leaked = DiscordRequestError(notify.KIND_HTTP, http_status=404)
+    _patch_sender(monkeypatch, [leaked])
+
+    rc = cli.main(["watch", str(tree), "--session-dir", str(sessions)])
+
+    assert rc == cli.EXIT_RUNTIME
+    captured = capsys.readouterr()
+    assert FAKE_WEBHOOK not in captured.out
+    assert FAKE_WEBHOOK not in captured.err
+    assert FAKE_OPENAI_KEY not in captured.out + captured.err
+    [root] = list(sessions.iterdir())
+    for name in ("session.json", "discord_payload.json", "errors.jsonl", "summary.json"):
+        path = root / name
+        if path.is_file():
+            raw = path.read_text(encoding="utf-8")
+            assert FAKE_WEBHOOK not in raw, f"{name} 에 Webhook URL 이 남았다"
+            assert FAKE_OPENAI_KEY not in raw, f"{name} 에 키가 남았다"

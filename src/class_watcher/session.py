@@ -57,6 +57,8 @@ class SessionPaths:
     summary_json: Path
     # `--dry-run` 세션에서만 생긴다. 외부 호출 없이 프롬프트까지 검증한 증거다 (PRD 10.2).
     prompt_json: Path
+    # 요약이 만들어진 세션에서만 생긴다. 전송 시도 "전"에 쓴다 (PRD 12절 복구 원칙).
+    discord_payload_json: Path
     # `--history` 일 때만 실제로 만들어진다 (PRD 9.1).
     history_dir: Path
 
@@ -75,6 +77,7 @@ def make_session_paths(session_dir: Path, session_id: str) -> SessionPaths:
         redaction_json=root / "redaction.json",
         summary_json=root / "summary.json",
         prompt_json=root / "prompt.json",
+        discord_payload_json=root / "discord_payload.json",
         history_dir=root / "history",
     )
 

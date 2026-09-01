@@ -4,9 +4,9 @@ httpx 를 import 하지 않는다. 실제 전송은 SendFn 으로 주입받으�
 없이 전 경로가 검증된다. 디스크를 만지는 것은 맨 아래 write_payload_json 하나뿐이다.
 
 렌더러가 알 수 있는 것은 RenderInput 이 전부다. diff·final.diff·정제본이 들어갈 자리가
-타입에 아예 없고, build_render_input 이 summary.json 의 `summary` 블록에서도 evidence·area
-를 읽지 않는다 — 모델이 diff 원문을 그 필드에 옮겨 와도 메시지에 닿을 경로가 없다
-(FR-051). 4단계가 PromptInput 으로 FR-037 을 끊은 것과 같은 수법이다.
+타입에 아예 없고, RenderKeyword 에는 파일 경로 필드 자체가 없다 — 모델이 diff 원문이나
+경로를 어느 필드에 옮겨 와도 메시지에 닿을 경로가 없다 (FR-051). 4단계가 PromptInput 으로
+FR-037 을 끊은 것과 같은 수법이다.
 """
 
 import json
@@ -18,10 +18,25 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import ENV_DISCORD_WEBHOOK_URL, ENV_OPENAI_API_KEY
-from .summarize import MAX_ARRAY_ITEMS, MAX_SUMMARY_CHARS, SOURCE_RULE_BASED
+from .summarize import (
+    CONFIDENCE_FALLBACK,
+    CONFIDENCE_HIGH,
+    CONFIDENCE_LEVELS,
+    KEYWORD_GROUP_FALLBACK,
+    KEYWORD_GROUPS,
+    KEYWORD_ITEM_FIELDS,
+    MAX_ARRAY_ITEMS,
+    MAX_CONCEPT_CHARS,
+    MAX_SUMMARY_CHARS,
+    MAX_SYNTAX_CHARS,
+    MAX_TERM_CHARS,
+    SOURCE_RULE_BASED,
+)
 
-# stats/session/redaction/summary 와 같은 버전 축.
-NOTIFY_SCHEMA_VERSION = "1.1"
+# summary.json 과 같은 축이고, stats/session/redaction 과는 여기서 갈라진다 — C-17 로
+# 형태가 바뀐(주요 변경 -> 오늘의 키워드) 두 문서만 1.2 다. 옛 discord_payload.json 이
+# sessions/ 에 영구히 남으므로(PRD 9.3) 버전이 두 형식을 구분하는 유일한 표식이다.
+NOTIFY_SCHEMA_VERSION = "1.2"
 
 # ── 추정 상수 — 저장소 안에 정본이 없다. 실전송 1회가 확정한다 ──────────────────
 # `추정`: Discord Webhook 본문 길이 상한.
@@ -31,15 +46,14 @@ MAX_CHUNKS = 2
 
 # ── 로컬 clamp — summarize.py 의 규율 연장 ────────────────────────────────────
 MAX_LINE_CHARS = 300
-# FR-050 이 첫 화면에 요구하는 변경 건수 = 축소 하한.
-FIRST_SCREEN_CHANGES = 2
-MAX_CHANGES_SHOWN = MAX_ARRAY_ITEMS
+# FR-050 이 첫 화면에 요구하는 키워드 건수 = 축소 하한.
+FIRST_SCREEN_KEYWORDS = 2
+MAX_ITEMS_SHOWN = MAX_ARRAY_ITEMS
 
-# 첫 화면 전용 상한 — MAX_LINE_CHARS 보다 작다. 이 둘이 없으면 최악 입력에서 FR-050(첫
+# 첫 화면 전용 상한 — MAX_LINE_CHARS 보다 작다. 이것이 없으면 최악 입력에서 FR-050(첫
 # 화면 4요소)과 FR-033(조각 <= limit)이 동시에 성립하지 않는다: session_title 은 4단계가
-# 길이를 clamp 하지 않고, changes[].file 도 모델 문자열이라 MAX_LINE_CHARS 까지 커진다.
+# 길이를 clamp 하지 않는다. keywords[] 쪽 상한은 4단계가 들고 있어 import 해서 쓴다.
 MAX_TITLE_CHARS = 80
-MAX_PATH_CHARS = 120
 
 # PRD 11.4 예시의 U+1F4DA·U+2022·U+2014·U+2026 은 전부 cp949 불가라 콘솔 리다이렉트에서
 # 프로세스를 죽인다. 같은 문자열이 콘솔로도 나가므로 처음부터 안전 문자만 쓴다.
@@ -51,10 +65,15 @@ OVERFLOW_NOTICE = "(이하 생략 - 전체 내용은 세션 폴더의 summary.js
 RULE_BASED_NOTICE = "[규칙 기반 요약 - 모델 요약이 아닙니다]"
 
 HEADER_SUMMARY = "요약"
-HEADER_CHANGES = "주요 변경"
-HEADER_LEARNING = "학습 포인트"
+HEADER_KEYWORDS = "오늘의 키워드"
 HEADER_QUESTIONS = "복습할 질문"
 HEADER_RISKS = "확인할 점"
+
+# PRD 11.4 의 `[객체생성]` 머리줄과 `· {term}  {syntax}` / 두 칸 들여쓴 설명 줄.
+GROUP_OPEN = "["
+GROUP_CLOSE = "]"
+SYNTAX_GAP = "  "
+CONCEPT_INDENT = "  "
 
 # "{기간} · N개 파일 변경 · +N / -N" 의 상한. 모델이 준 정수라 자릿수 보장이 없어
 # render_message 가 이 값으로 실제로 자른다 — 안 자르면 아래 산수가 가정에 불과해진다.
@@ -62,17 +81,48 @@ META_LINE_MAX = 60
 # "(1/2) "
 CHUNK_MARK_MAX = 6
 
+
+def confidence_mark(confidence: str) -> str:
+    """high 면 표시 없음, 아니면 " (medium)" 꼴 (PRD 11.4).
+
+    목록 밖 값을 CONFIDENCE_FALLBACK 으로 흡수한다. 모델 문자열을 그대로 줄에 실으면
+    개행 하나로 FR-051 방어선이 뚫리고 아래 MAX_CONFIDENCE_MARK 예산도 무의미해진다.
+
+    상수보다 위가 아니라 상수 블록 한가운데에 있는 이유: MAX_CONFIDENCE_MARK 를 이
+    함수에서 파생시켜 표기와 예산이 갈라질 수 없게 했다.
+    """
+    level = confidence if confidence in CONFIDENCE_LEVELS else CONFIDENCE_FALLBACK
+    return "" if level == CONFIDENCE_HIGH else f" ({level})"
+
+
+MAX_GROUP_LABEL = max(len(name) for name in KEYWORD_GROUPS) + len(GROUP_OPEN) + len(GROUP_CLOSE)
+MAX_CONFIDENCE_MARK = max(len(confidence_mark(level)) for level in CONFIDENCE_LEVELS)
+
+# 키워드 한 건이 첫 화면에서 먹는 최악 문자수. 최악은 2건이 서로 다른 분류에 들어가
+# 그룹 머리줄을 각각 한 줄씩 쓰는 경우라, 그룹 머리줄을 건당으로 센다.
+KEYWORD_BLOCK_MAX = (
+    1  # 분류 사이 빈 줄
+    + MAX_GROUP_LABEL + 1  # "[객체생성]"
+    + len(BULLET) + MAX_TERM_CHARS + MAX_CONFIDENCE_MARK
+    + len(SYNTAX_GAP) + MAX_SYNTAX_CHARS + 1  # 키워드 줄
+    + len(CONCEPT_INDENT) + MAX_CONCEPT_CHARS + 1  # 설명 줄
+)
+
 # 첫 화면 예산 (FR-050 x FR-033). 숫자를 흩뿌리지 않는다 — 상한을 바꾸면 이 식이 따라
 # 움직인다. DISCORD_CONTENT_LIMIT 이 `추정`이라 틀릴 수 있으므로 산수도 상수로 둔다.
+# 판정 단계 실측으로 KEYWORD_BLOCK_MAX = 199, 이 값 = 1190 (옛 형식은 1619 였다).
+# 값 자체를 단언하지 말고 <= DISCORD_CONTENT_LIMIT 관계를 단언해라 — 상한을 바꾸면
+# 숫자는 움직이고 관계는 남는다.
 FIRST_SCREEN_MAX_CHARS = (
     len(TITLE_PREFIX) + MAX_TITLE_CHARS + 1  # 제목 줄
     + META_LINE_MAX + 1  # 메타 줄
+    + len(RULE_BASED_NOTICE) + 1  # FR-039 표시
     + 1  # 빈 줄
     + len(HEADER_SUMMARY) + 1
     + MAX_SUMMARY_CHARS + 1
     + 1  # 빈 줄
-    + len(HEADER_CHANGES) + 1
-    + FIRST_SCREEN_CHANGES * (len("1. ") + MAX_PATH_CHARS + len(" - ") + MAX_LINE_CHARS + 1)
+    + len(HEADER_KEYWORDS) + 1
+    + FIRST_SCREEN_KEYWORDS * KEYWORD_BLOCK_MAX
     + CHUNK_MARK_MAX
 )
 
@@ -129,21 +179,18 @@ SendFn = Callable[[Mapping[str, object]], int]
 
 
 @dataclass(frozen=True)
-class RenderChange:
-    """PRD 11.4 "주요 변경" 한 줄의 재료.
+class RenderKeyword:
+    """PRD 11.4 "오늘의 키워드" 한 항목의 재료.
 
-    evidence 와 area 를 필드로 두지 않는 것이 FR-051 의 구조적 방어선이다.
+    file·area·evidence 를 필드로 두지 않는 것이 FR-051 의 구조적 방어선이다.
+    옛 RenderChange 는 file 을 들고 있었지만 keywords[] 에는 경로 개념 자체가 없다.
     """
 
-    file: str
-    type: str
-    description: str
-
-
-@dataclass(frozen=True)
-class RenderLearning:
-    topic: str
-    explanation: str
+    term: str
+    syntax: str
+    concept: str
+    group: str
+    confidence: str
 
 
 @dataclass(frozen=True)
@@ -158,8 +205,7 @@ class RenderInput:
     added_lines: int
     deleted_lines: int
     summary: str
-    changes: tuple[RenderChange, ...]
-    learning_points: tuple[RenderLearning, ...]
+    keywords: tuple[RenderKeyword, ...]
     questions: tuple[str, ...]
     risks: tuple[str, ...]
     # True 면 FR-039 "LLM 요약이 아님" 표시를 첫 화면에 박는다.
@@ -210,20 +256,6 @@ def sanitize_line(text: str, limit: int = MAX_LINE_CHARS) -> str:
     return cleaned[: max(0, limit - len(TRUNCATION_MARK))] + TRUNCATION_MARK
 
 
-def sanitize_path(text: str, limit: int = MAX_PATH_CHARS) -> str:
-    """경로 전용 무해화. 앞이 아니라 **뒤를 남긴다**.
-
-    앞을 남기면 `src/com/academy/...` 만 보여 어느 파일인지 못 읽는다.
-    """
-    cleaned = _fold(text)
-    if len(cleaned) <= limit:
-        return cleaned
-    keep = limit - len(TRUNCATION_MARK)
-    if keep <= 0:
-        return TRUNCATION_MARK[:limit]
-    return TRUNCATION_MARK + cleaned[-keep:]
-
-
 def _parse_iso(value: str) -> datetime | None:
     try:
         return datetime.fromisoformat(value)
@@ -258,47 +290,54 @@ def _as_int(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def _render_changes(block: object) -> tuple[RenderChange, ...]:
+def _render_keywords(block: object) -> tuple[RenderKeyword, ...]:
+    """summary.json 의 keywords[] → RenderKeyword.
+
+    한 항목이 망가져도 continue 로 넘긴다 — 옛 형식 doc 이나 손으로 고친 doc 에서
+    나머지 키워드까지 통째로 잃지 않게 한다. 여기서 읽는 키는 다섯 개뿐이라
+    evidence·file 같은 키가 섞여 있어도 렌더에 닿을 자리가 없다 (FR-051).
+    """
     if not isinstance(block, list):
         return ()
-    items: list[RenderChange] = []
-    for entry in block[:MAX_CHANGES_SHOWN]:
+    items: list[RenderKeyword] = []
+    for entry in block[:MAX_ITEMS_SHOWN]:
         if not isinstance(entry, dict):
             continue
-        file = entry.get("file")
-        description = entry.get("description")
-        if not isinstance(file, str) or not isinstance(description, str):
+        fields = {key: entry.get(key) for key in KEYWORD_ITEM_FIELDS}
+        if any(not isinstance(value, str) for value in fields.values()):
             continue
-        type_ = entry.get("type")
         items.append(
-            RenderChange(
-                file=file,
-                type=type_ if isinstance(type_, str) else "",
-                description=description,
+            RenderKeyword(
+                term=str(fields["term"]),
+                syntax=str(fields["syntax"]),
+                concept=str(fields["concept"]),
+                group=str(fields["group"]),
+                confidence=str(fields["confidence"]),
             )
         )
     return tuple(items)
 
 
-def _render_learning(block: object) -> tuple[RenderLearning, ...]:
-    if not isinstance(block, list):
-        return ()
-    items: list[RenderLearning] = []
-    for entry in block[:MAX_CHANGES_SHOWN]:
-        if not isinstance(entry, dict):
-            continue
-        topic = entry.get("topic")
-        explanation = entry.get("explanation")
-        if not isinstance(topic, str) or not isinstance(explanation, str):
-            continue
-        items.append(RenderLearning(topic=topic, explanation=explanation))
-    return tuple(items)
+def group_keywords(
+    keywords: Sequence[RenderKeyword],
+) -> tuple[tuple[str, tuple[RenderKeyword, ...]], ...]:
+    """분류별 묶음. KEYWORD_GROUPS 순서 고정, 빈 분류는 빠진다 (PRD 11.4).
+
+    KEYWORD_GROUPS 밖의 group 은 KEYWORD_GROUP_FALLBACK 버킷으로 흡수한다 — 렌더가
+    키워드를 조용히 떨어뜨리는 경로를 만들지 않는다. 전송은 성공하고 메시지만 비는
+    실패는 게이트가 못 잡기 때문이다 (validate_summary 의 강등에 이은 2차 그물).
+    """
+    buckets: dict[str, list[RenderKeyword]] = {name: [] for name in KEYWORD_GROUPS}
+    for keyword in keywords:
+        name = keyword.group if keyword.group in buckets else KEYWORD_GROUP_FALLBACK
+        buckets[name].append(keyword)
+    return tuple((name, tuple(buckets[name])) for name in KEYWORD_GROUPS if buckets[name])
 
 
 def _render_strings(block: object) -> tuple[str, ...]:
     if not isinstance(block, list):
         return ()
-    return tuple(entry for entry in block[:MAX_CHANGES_SHOWN] if isinstance(entry, str))
+    return tuple(entry for entry in block[:MAX_ITEMS_SHOWN] if isinstance(entry, str))
 
 
 def build_render_input(
@@ -310,7 +349,9 @@ def build_render_input(
 ) -> RenderInput | None:
     """summary.json 전체 doc → RenderInput. 필수 재료가 없으면 None (stats-only 로 흐른다).
 
-    `summary` 블록 안에서도 evidence·area 를 읽지 않는다 (FR-051, 판정 9번 ③).
+    `summary` 블록에서 읽는 것은 RenderInput 에 자리가 있는 필드뿐이다 (FR-051).
+    keywords 가 없는 옛 형식 doc 은 None 이 아니라 keywords=() 로 흐른다 — 요약과
+    통계는 여전히 보낼 수 있다.
     """
     block = summary_doc.get("summary")
     if not isinstance(block, dict):
@@ -329,16 +370,28 @@ def build_render_input(
         added_lines=_as_int(stats_map.get("added_lines")),
         deleted_lines=_as_int(stats_map.get("deleted_lines")),
         summary=summary,
-        changes=_render_changes(block.get("changes")),
-        learning_points=_render_learning(block.get("learning_points")),
+        keywords=_render_keywords(block.get("keywords")),
         questions=_render_strings(block.get("questions_to_review")),
         risks=_render_strings(block.get("risks_or_todos")),
         rule_based=summary_doc.get("source") == SOURCE_RULE_BASED,
     )
 
 
+def _keyword_lines(keyword: RenderKeyword) -> list[str]:
+    """`· {term}  {syntax}` 와 두 칸 들여쓴 설명 줄 (PRD 11.4).
+
+    syntax 에도 sanitize_line 을 균일하게 건다. `--i` 처럼 +/- 로 시작하는 표기는 앞
+    기호를 잃지만, 예외를 두면 FR-051 방어선이 "렌더가 syntax 를 줄 맨 앞에 두지
+    않는다"는 배치 순서에 의존하게 된다. P0 를 배치에 걸지 않는다.
+    """
+    term = sanitize_line(keyword.term, limit=MAX_TERM_CHARS) + confidence_mark(keyword.confidence)
+    syntax = sanitize_line(keyword.syntax, limit=MAX_SYNTAX_CHARS)
+    head = f"{BULLET}{term}{SYNTAX_GAP}{syntax}" if syntax else f"{BULLET}{term}"
+    return [head, CONCEPT_INDENT + sanitize_line(keyword.concept, limit=MAX_CONCEPT_CHARS)]
+
+
 def render_message(inp: RenderInput) -> str:
-    """섹션 순서가 곧 FR-050 의 우선순위다. 첫 화면은 제목·메타·요약·변경 2건이다."""
+    """섹션 순서가 곧 FR-050 의 우선순위다. 첫 화면은 제목·메타·요약·키워드 2건이다."""
     lines: list[str] = [
         TITLE_PREFIX + sanitize_line(inp.title, limit=MAX_TITLE_CHARS),
         _meta_line(
@@ -349,18 +402,12 @@ def render_message(inp: RenderInput) -> str:
         lines.append(RULE_BASED_NOTICE)
     lines.extend(["", HEADER_SUMMARY, sanitize_line(inp.summary, limit=MAX_SUMMARY_CHARS)])
 
-    if inp.changes:
-        lines.extend(["", HEADER_CHANGES])
-        for index, change in enumerate(inp.changes, start=1):
-            lines.append(
-                f"{index}. {sanitize_path(change.file)} - {sanitize_line(change.description)}"
-            )
-    if inp.learning_points:
-        lines.extend(["", HEADER_LEARNING])
-        lines.extend(
-            f"{BULLET}{sanitize_line(point.topic)}: {sanitize_line(point.explanation)}"
-            for point in inp.learning_points
-        )
+    if inp.keywords:
+        lines.extend(["", HEADER_KEYWORDS])
+        for group, items in group_keywords(inp.keywords):
+            lines.extend(["", f"{GROUP_OPEN}{group}{GROUP_CLOSE}"])
+            for keyword in items:
+                lines.extend(_keyword_lines(keyword))
     if inp.questions:
         lines.extend(["", HEADER_QUESTIONS])
         lines.extend(f"{BULLET}{sanitize_line(question)}" for question in inp.questions)
@@ -403,21 +450,21 @@ def _shrink_questions(inp: RenderInput) -> RenderInput:
     return replace(inp, questions=inp.questions[:1])
 
 
-def _shrink_learning(inp: RenderInput) -> RenderInput:
-    return replace(inp, learning_points=inp.learning_points[:2])
+def _shrink_keywords(inp: RenderInput) -> RenderInput:
+    """모델이 준 배열 순서로 앞 2건을 남긴다.
+
+    분류별 묶음은 이 절단 뒤에 일어나므로 상위 2건이 서로 다른 분류여도 둘 다 렌더된다.
+    """
+    return replace(inp, keywords=inp.keywords[:FIRST_SCREEN_KEYWORDS])
 
 
-def _shrink_changes(inp: RenderInput) -> RenderInput:
-    return replace(inp, changes=inp.changes[:FIRST_SCREEN_CHANGES])
-
-
-# 축소 하한은 여기까지다. 제목·메타·summary·주요 변경 2건은 어떤 경우에도 줄이지 않는다
-# — FR-050 의 수용 기준이 그 넷을 첫 화면에 요구한다.
+# 축소 하한은 여기까지다. 제목·메타·summary·키워드 2건은 어떤 경우에도 줄이지 않는다
+# — FR-050 의 수용 기준이 그 넷을 첫 화면에 요구한다. risks 가 먼저 빠지는 순서는
+# PRD 11.4 「축소 시 가장 먼저 빠진다」 그대로다.
 _SHRINK_STEPS: tuple[tuple[str, Callable[[RenderInput], RenderInput]], ...] = (
     ("risks", _shrink_risks),
     ("questions", _shrink_questions),
-    ("learning_points", _shrink_learning),
-    ("changes", _shrink_changes),
+    ("keywords", _shrink_keywords),
 )
 
 

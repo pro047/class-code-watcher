@@ -27,6 +27,7 @@ from .summarize import (
     KEYWORD_ITEM_FIELDS,
     MAX_ARRAY_ITEMS,
     MAX_CONCEPT_CHARS,
+    MAX_KEYWORDS,
     MAX_SUMMARY_CHARS,
     MAX_SYNTAX_CHARS,
     MAX_TERM_CHARS,
@@ -46,9 +47,16 @@ MAX_CHUNKS = 2
 
 # ── 로컬 clamp — summarize.py 의 규율 연장 ────────────────────────────────────
 MAX_LINE_CHARS = 300
+# 질문·확인할 점 한 줄의 상한. MAX_LINE_CHARS 보다 작다 — 이것이 없으면 모든 필드가
+# 상한인 입력에서 축소가 발동해 키워드가 2건으로 붕괴한다(아래 FULL_MESSAGE_MAX_CHARS).
+# MAX_TITLE_CHARS 와 같은 이유의 로컬 clamp 다. 개념 한 문장이 90자이므로 복습 질문
+# 한 문장에 120 은 넉넉하고, 예산에는 여유를 남긴다.
+MAX_ITEM_CHARS = 120
 # FR-050 이 첫 화면에 요구하는 키워드 건수 = 축소 하한.
 FIRST_SCREEN_KEYWORDS = 2
 MAX_ITEMS_SHOWN = MAX_ARRAY_ITEMS
+# 배열 상한이 갈렸다 (PRD 11.3, C-18) — 키워드만 15 다.
+MAX_KEYWORDS_SHOWN = MAX_KEYWORDS
 
 # 첫 화면 전용 상한 — MAX_LINE_CHARS 보다 작다. 이것이 없으면 최악 입력에서 FR-050(첫
 # 화면 4요소)과 FR-033(조각 <= limit)이 동시에 성립하지 않는다: session_title 은 4단계가
@@ -63,6 +71,11 @@ BULLET = "· "
 TRUNCATION_MARK = "..."
 OVERFLOW_NOTICE = "(이하 생략 - 전체 내용은 세션 폴더의 summary.json 에 있습니다)"
 RULE_BASED_NOTICE = "[규칙 기반 요약 - 모델 요약이 아닙니다]"
+# PRD 11.4 「절단 표시」. RULE_BASED_NOTICE 와 같은 자리·같은 방식이다 — 둘 다 "이 요약의
+# 근거가 온전하지 않다"는 같은 종류의 사실이다. 수신자는 코드를 안 보는 사람이라
+# "프롬프트 예산" 같은 도구 내부 용어를 쓰지 않는다. `[` 로 시작하므로 FR-051 검사에
+# 걸리지 않고, cp949 안전 문자만 쓴다(같은 문자열이 콘솔로도 나간다).
+TRUNCATED_NOTICE = "[근거 일부 누락 - 코드가 많아 일부만 요약했습니다]"
 
 HEADER_SUMMARY = "요약"
 HEADER_KEYWORDS = "오늘의 키워드"
@@ -110,13 +123,13 @@ KEYWORD_BLOCK_MAX = (
 
 # 첫 화면 예산 (FR-050 x FR-033). 숫자를 흩뿌리지 않는다 — 상한을 바꾸면 이 식이 따라
 # 움직인다. DISCORD_CONTENT_LIMIT 이 `추정`이라 틀릴 수 있으므로 산수도 상수로 둔다.
-# 판정 단계 실측으로 KEYWORD_BLOCK_MAX = 199, 이 값 = 1190 (옛 형식은 1619 였다).
-# 값 자체를 단언하지 말고 <= DISCORD_CONTENT_LIMIT 관계를 단언해라 — 상한을 바꾸면
-# 숫자는 움직이고 관계는 남는다.
+# 값 자체를 단언하지 말고 <= DISCORD_CONTENT_LIMIT 관계를 단언해라 — 문구를 한 글자만
+# 고쳐도 숫자는 움직이고 관계는 남는다. 표시 두 줄이 동시에 참이어도 계상돼 있다.
 FIRST_SCREEN_MAX_CHARS = (
     len(TITLE_PREFIX) + MAX_TITLE_CHARS + 1  # 제목 줄
     + META_LINE_MAX + 1  # 메타 줄
     + len(RULE_BASED_NOTICE) + 1  # FR-039 표시
+    + len(TRUNCATED_NOTICE) + 1  # PRD 11.4 절단 표시
     + 1  # 빈 줄
     + len(HEADER_SUMMARY) + 1
     + MAX_SUMMARY_CHARS + 1
@@ -124,6 +137,23 @@ FIRST_SCREEN_MAX_CHARS = (
     + len(HEADER_KEYWORDS) + 1
     + FIRST_SCREEN_KEYWORDS * KEYWORD_BLOCK_MAX
     + CHUNK_MARK_MAX
+)
+
+# 축소되지 않는 머리 부분 (제목·메타·표시 2줄·요약·키워드 머리).
+NON_SHRINKABLE_MAX_CHARS = (
+    FIRST_SCREEN_MAX_CHARS - FIRST_SCREEN_KEYWORDS * KEYWORD_BLOCK_MAX - CHUNK_MARK_MAX
+)
+
+# shrink 가 다 깎은 뒤에도 남는 바닥. risks 는 통째로 빠지고 질문은 1건까지만 줄어든다.
+QUESTION_FLOOR_MAX_CHARS = 1 + len(HEADER_QUESTIONS) + 1 + len(BULLET) + MAX_ITEM_CHARS + 1
+
+# PRD 11.3 이 요구한 관계식의 좌변 — 키워드 상한이 붕괴하지 않음의 증명 대상이다.
+# 값이 아니라 이 식과 (DISCORD_CONTENT_LIMIT - CHUNK_MARK_MAX) * MAX_CHUNKS 의 관계를
+# 단언해라.
+FULL_MESSAGE_MAX_CHARS = (
+    NON_SHRINKABLE_MAX_CHARS
+    + MAX_KEYWORDS_SHOWN * KEYWORD_BLOCK_MAX
+    + QUESTION_FLOOR_MAX_CHARS
 )
 
 # WatchOutcome.discord_state — cli 의 콘솔·종료 코드 매핑 기준.
@@ -210,6 +240,9 @@ class RenderInput:
     risks: tuple[str, ...]
     # True 면 FR-039 "LLM 요약이 아님" 표시를 첫 화면에 박는다.
     rule_based: bool
+    # 프롬프트 예산 초과로 diff 가 잘린 세션. summary.json 의 input.truncated 에서 온다.
+    # MessagePlan.truncated(조각 하드 절단)와 다른 것이다 — 이름이 같아 착각하기 쉽다.
+    truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -300,7 +333,7 @@ def _render_keywords(block: object) -> tuple[RenderKeyword, ...]:
     if not isinstance(block, list):
         return ()
     items: list[RenderKeyword] = []
-    for entry in block[:MAX_ITEMS_SHOWN]:
+    for entry in block[:MAX_KEYWORDS_SHOWN]:
         if not isinstance(entry, dict):
             continue
         fields = {key: entry.get(key) for key in KEYWORD_ITEM_FIELDS}
@@ -340,6 +373,11 @@ def _render_strings(block: object) -> tuple[str, ...]:
     return tuple(entry for entry in block[:MAX_ITEMS_SHOWN] if isinstance(entry, str))
 
 
+def _input_truncated(block: object) -> bool:
+    """summary.json 의 input.truncated. 블록이 없는 옛 형식 doc 은 False 로 흐른다."""
+    return bool(block.get("truncated")) if isinstance(block, dict) else False
+
+
 def build_render_input(
     summary_doc: Mapping[str, object],
     *,
@@ -374,6 +412,7 @@ def build_render_input(
         questions=_render_strings(block.get("questions_to_review")),
         risks=_render_strings(block.get("risks_or_todos")),
         rule_based=summary_doc.get("source") == SOURCE_RULE_BASED,
+        truncated=_input_truncated(summary_doc.get("input")),
     )
 
 
@@ -398,8 +437,12 @@ def render_message(inp: RenderInput) -> str:
             inp.started_at, inp.ended_at, inp.files_changed, inp.added_lines, inp.deleted_lines
         ),
     ]
+    # 둘 다 참이면 규칙 기반 표시가 먼저다 — "요약을 누가 만들었나"가 "근거가 온전한가"
+    # 보다 상위 사실이다 (PRD 11.4: 두 표시는 메타 줄 아래 같은 자리).
     if inp.rule_based:
         lines.append(RULE_BASED_NOTICE)
+    if inp.truncated:
+        lines.append(TRUNCATED_NOTICE)
     lines.extend(["", HEADER_SUMMARY, sanitize_line(inp.summary, limit=MAX_SUMMARY_CHARS)])
 
     if inp.keywords:
@@ -410,10 +453,15 @@ def render_message(inp: RenderInput) -> str:
                 lines.extend(_keyword_lines(keyword))
     if inp.questions:
         lines.extend(["", HEADER_QUESTIONS])
-        lines.extend(f"{BULLET}{sanitize_line(question)}" for question in inp.questions)
+        lines.extend(
+            f"{BULLET}{sanitize_line(question, limit=MAX_ITEM_CHARS)}"
+            for question in inp.questions
+        )
     if inp.risks:
         lines.extend(["", HEADER_RISKS])
-        lines.extend(f"{BULLET}{sanitize_line(risk)}" for risk in inp.risks)
+        lines.extend(
+            f"{BULLET}{sanitize_line(risk, limit=MAX_ITEM_CHARS)}" for risk in inp.risks
+        )
     return "\n".join(lines)
 
 
@@ -472,7 +520,10 @@ def shrink(
     inp: RenderInput, *, limit: int, max_chunks: int
 ) -> tuple[RenderInput, tuple[str, ...]]:
     """항목 수를 줄여 축소한다. 실제로 줄인 단계만 이름을 남긴다."""
-    budget = limit * max_chunks
+    # split_text 는 2조각이 되는 순간 각 조각에서 조각 번호 자리를 빼고 자르므로 실제
+    # 수용량은 limit 보다 그만큼 작다. 키워드가 15건까지 늘면서 최악값이 천장에 붙어
+    # 이 차이에 닿는다.
+    budget = (limit - CHUNK_MARK_MAX) * max_chunks
     current = inp
     shrunk: list[str] = []
     for name, reducer in _SHRINK_STEPS:

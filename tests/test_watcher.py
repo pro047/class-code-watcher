@@ -919,16 +919,16 @@ VALID_SUMMARY_TEXT = json.dumps(
         "session_title": "검증",
         "summary": "값을 바꾸는 변경을 했다.",
         "change_stats": {"files_changed": 1, "added_lines": 1, "deleted_lines": 1},
-        "changes": [
+        # C-17 로 changes[]/learning_points[] 가 keywords[] 하나로 합쳐졌다.
+        "keywords": [
             {
-                "file": "a.py",
-                "area": "핵심",
-                "type": "modified",
-                "description": "변수 값을 바꾸는 코드",
-                "evidence": "x = 2",
+                "term": "대입 연산자",
+                "concept": "변수에 값을 넣는 연산자다.",
+                "syntax": "=",
+                "group": "연산자",
+                "confidence": "high",
             }
         ],
-        "learning_points": [],
         "questions_to_review": [],
         "risks_or_todos": [],
         "sensitive_data_detected": False,
@@ -1377,7 +1377,7 @@ def test_no_discord_session_renders_to_console_and_keeps_payload(
     joined.encode("cp949")
     # 전송 시도 전에 쓰므로 --no-discord 에서도 남는다 (PRD 12절 복구 원칙).
     payload = json.loads(paths.discord_payload_json.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == "1.1"
+    assert payload["schema_version"] == notify.NOTIFY_SCHEMA_VERSION == "1.2"
     assert payload["chunks"] == 1
     assert FAKE_WEBHOOK not in paths.discord_payload_json.read_text(encoding="utf-8")
 
@@ -1494,8 +1494,8 @@ def test_successful_delivery_counts_one_request_and_records_status(
 def test_delivered_payload_carries_no_diff_lines_or_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # 불변식 (FR-051): 모델이 diff 원문을 evidence·description 에 옮겨 와도 전송
-    # payload 에는 `+`/`-` 로 시작하는 줄이 없고 evidence 자체가 실리지 않는다.
+    # 불변식 (FR-051): 모델이 diff 원문을 어느 필드에 옮겨 와도 전송 payload 에는
+    # `+`/`-` 로 시작하는 줄이 없고, 스키마 밖 필드(옛 evidence 등)는 실리지 않는다.
     config, paths, selection = _setup_session(tmp_path)
     _script_loop(monkeypatch, [_change_a_py(config.watch_root)])
     leaked = "+ String pw = user.getPassword();"
@@ -1504,16 +1504,18 @@ def test_delivered_payload_carries_no_diff_lines_or_evidence(
             "session_title": "검증",
             "summary": "- 값을 바꾸는 변경을 했다.",
             "change_stats": {"files_changed": 1, "added_lines": 1, "deleted_lines": 1},
-            "changes": [
+            "keywords": [
                 {
-                    "file": "a.py",
-                    "area": "핵심",
-                    "type": "modified",
-                    "description": "--- a/a.py 를 고쳤다",
+                    "term": "- 대입 연산자",
+                    "concept": "--- a/a.py 를 고쳤다",
+                    "syntax": "+=",
+                    "group": "연산자",
+                    "confidence": "high",
+                    # 스키마 밖 필드. 4단계 검증도 5단계 렌더도 읽지 않는다.
                     "evidence": f"--- a/a.py\n{leaked}",
+                    "area": "핵심",
                 }
             ],
-            "learning_points": [],
             "questions_to_review": [],
             "risks_or_todos": [],
             "sensitive_data_detected": False,
@@ -1538,9 +1540,12 @@ def test_delivered_payload_carries_no_diff_lines_or_evidence(
     saved = json.loads(paths.discord_payload_json.read_text(encoding="utf-8"))
     for entry in saved["payloads"]:
         assert find_diff_lines(entry["content"]) == ()
-    # summary.json 에는 evidence 가 그대로 남는다 — 메시지에서만 뺀다 (판정 9번 ③).
+    # C-17 로 evidence 가 스키마에서 사라졌다 — 4단계 검증이 keywords[] 의 다섯 필드만
+    # 통과시키므로 summary.json 에도 남지 않는다 (렌더 이전에 끊긴다).
     summary = json.loads(paths.summary_json.read_text(encoding="utf-8"))
-    assert summary["summary"]["changes"][0]["evidence"]
+    [keyword] = summary["summary"]["keywords"]
+    assert set(keyword) == {"term", "concept", "syntax", "group", "confidence"}
+    assert leaked not in paths.summary_json.read_text(encoding="utf-8")
 
 
 def test_payload_write_failure_stops_delivery(

@@ -19,15 +19,22 @@ from pathlib import Path
 from .diffgen import STATUS_SKIPPED, DiffResult
 
 # stats/session/redaction 과는 여기서 축이 갈라진다 — C-17 로 응답 스키마의 형태 자체가
-# 바뀐(changes[] -> keywords[]) 문서만 1.2 다. 옛 형식 summary.json 이 sessions/ 에 영구히
-# 남으므로(PRD 9.3) 버전이 같으면 사람도 도구도 두 형식을 구분할 수 없다.
-SUMMARY_SCHEMA_VERSION = "1.2"
+# 바뀐(changes[] -> keywords[]) 문서만 1.2 였고, C-18 로 input 블록에 partial_files 가
+# 생기고 omitted_files 의 의미가 좁아져 1.3 이 됐다. 옛 형식 summary.json 이 sessions/ 에
+# 영구히 남으므로(PRD 9.3) 버전이 같으면 사람도 도구도 형식을 구분할 수 없다 —
+# 1.2 의 truncated 는 "diff 가 0 일 수도 있다", 1.3 의 같은 값은 "hunk 단위로 실렸다"다.
+SUMMARY_SCHEMA_VERSION = "1.3"
 
 # FR-030 의 세션 상한. 이 상수 밖으로 나가는 호출 경로를 만들지 않는다.
 MAX_ATTEMPTS = 2
 
-# PRD 11.3 검증 규칙.
+# PRD 11.3 검증 규칙. 배열 상한은 하나가 아니다 (C-18) — questions_to_review 와
+# risks_or_todos 만 이 값을 쓴다. keywords 는 하루치를 담아야 해서 축이 갈라졌다.
 MAX_ARRAY_ITEMS = 5
+# 15 는 산수로 나온 값이다: notify 의 예산식이
+# 고정부 + MAX_KEYWORDS * KEYWORD_BLOCK_MAX <= DISCORD_CONTENT_LIMIT * MAX_CHUNKS 를
+# 만족하는 상한이다. 상한을 없애면 오히려 축소가 발동해 키워드 2건짜리 메시지가 나간다.
+MAX_KEYWORDS = 15
 MAX_SUMMARY_CHARS = 600
 MAX_CONCEPT_CHARS = 90
 MAX_SYNTAX_CHARS = 44
@@ -64,9 +71,15 @@ _KEYWORD_CHAR_LIMITS: tuple[tuple[str, int], ...] = (
     ("syntax", MAX_SYNTAX_CHARS),
 )
 
-# PRD 7절 "입력 8k 토큰 이하". 토크나이저를 붙일 수 없어(의존성 게이트) 문자로 환산했다 —
-# 코드 diff 를 보수적으로 2.5자/토큰으로 잡은 `추정`값이라 실측 후 이 한 줄로 조정한다.
-PROMPT_DIFF_BUDGET_CHARS = 20_000
+# C-18 로 요약 단위가 "하루 1세션"이 되면서 20,000 에서 올렸다 — 오전 반나절 실측이
+# 19,999자였고 하루치를 약 40,000자로 잡아 1.5배 여유를 뒀다(`추정`). 토크나이저를 붙일
+# 수 없어(의존성 게이트) 문자로 환산했고, 2.5자/토큰 `추정`으로 약 24k 토큰이다.
+# 실측 후 이 한 줄로 조정한다.
+PROMPT_DIFF_BUDGET_CHARS = 60_000
+
+# hunk 머리줄. per-file diff 에서 열 0 의 `@@` 는 hunk 헤더뿐이다 — 본문 라인은
+# difflib 가 ' '/'+'/'-' 로 한 칸 들여 쓰므로 `@` 로 시작할 수 없다.
+_HUNK_HEADER_PREFIX = "@@"
 
 # FR-042: 검증 실패 원본은 발췌만 남긴다. 발췌에도 mask_secrets 를 거는 것은 기록하는 쪽 책임이다.
 RAW_EXCERPT_CHARS = 2000
@@ -135,11 +148,24 @@ class PromptInput:
 
 
 @dataclass(frozen=True)
+class PartialFile:
+    """예산 때문에 일부 hunk 만 실린 파일 (PRD 11.1 원칙 6 의 '절단 사실과 범위')."""
+
+    rel_path: str
+    included_hunks: int
+    total_hunks: int
+
+
+@dataclass(frozen=True)
 class BuiltPrompt:
     system: str
     user: str
+    # 필드 이름과 소비처(input.truncated -> Discord 절단 표시)를 유지하려고 의미를
+    # 넓혔다 — 통째로 빠진 파일이 없어도 hunk 단위로 잘렸으면 참이다.
     truncated: bool
+    # 한 hunk 도 못 실은 파일. C-18 이전에는 "예산을 넘긴 파일 전부"였다.
     omitted_files: tuple[str, ...]
+    partial_files: tuple[PartialFile, ...]
     diff_chars: int
 
 
@@ -306,7 +332,12 @@ def _totals(files: Sequence[PromptFileStat]) -> tuple[int, int, int]:
     )
 
 
-def _user_prompt(inp: PromptInput, diff_text: str, omitted: Sequence[str]) -> str:
+def _user_prompt(
+    inp: PromptInput,
+    diff_text: str,
+    omitted: Sequence[str],
+    partial: Sequence[PartialFile],
+) -> str:
     files_changed, added, deleted = _totals(inp.files)
     lines = [
         f"세션 제목: {inp.title}",
@@ -319,9 +350,22 @@ def _user_prompt(inp: PromptInput, diff_text: str, omitted: Sequence[str]) -> st
         for item in inp.files
     )
     lines.append(f"합산: {files_changed}개 파일, +{added} / -{deleted}")
+    # 절단 사실과 범위는 <diff> 블록 밖에 둔다. 블록 안은 diff 문법만 있어야 데이터와
+    # 지시의 경계가 흐려지지 않는다 (PRD 13.3 위협 6).
     if omitted:
         lines.extend(
             ["", "다음 파일은 예산 초과로 통계만 제공: " + ", ".join(omitted)]
+        )
+    if partial:
+        lines.extend(
+            [
+                "",
+                "다음 파일은 예산 초과로 일부만 포함: "
+                + ", ".join(
+                    f"{item.rel_path} (hunk {item.included_hunks}/{item.total_hunks})"
+                    for item in partial
+                ),
+            ]
         )
     lines.extend(
         [
@@ -338,8 +382,9 @@ def _user_prompt(inp: PromptInput, diff_text: str, omitted: Sequence[str]) -> st
     lines.extend(
         [
             "",
-            f"제약: 모든 배열은 최대 {MAX_ARRAY_ITEMS}개, summary 는 {MAX_SUMMARY_CHARS}자 이하.",
-            f"keywords 는 1개 이상 {MAX_ARRAY_ITEMS}개 이하로 채운다. "
+            f"제약: summary 는 {MAX_SUMMARY_CHARS}자 이하, "
+            f"risks_or_todos 는 {MAX_ARRAY_ITEMS}개 이하.",
+            f"keywords 는 1개 이상 {MAX_KEYWORDS}개 이하로 채운다. "
             f"concept 는 {MAX_CONCEPT_CHARS}자 이하의 한 문장, "
             f"syntax 는 {MAX_SYNTAX_CHARS}자 이하의 문법 표기이며 "
             "해당 표기가 없으면 빈 문자열로 둔다. "
@@ -353,14 +398,56 @@ def _user_prompt(inp: PromptInput, diff_text: str, omitted: Sequence[str]) -> st
     return "\n".join(lines)
 
 
+def split_hunks(file_diff: str) -> tuple[str, tuple[str, ...]]:
+    """per-file diff 를 (헤더, hunk 튜플) 로 나눈다.
+
+    헤더는 첫 `@@` 앞의 줄 전부(정상 경로에서는 `--- a/…`·`+++ b/…` 두 줄)다.
+    hunk 하나는 `@@` 머리줄부터 다음 `@@` 머리줄 직전까지다. `@@` 가 하나도 없으면
+    (전문, ()) 을 돌려준다 — 마스킹이 머리줄을 먹은 조각에서 예외를 내지 않는다.
+    """
+    header: list[str] = []
+    hunks: list[list[str]] = []
+    for line in file_diff.splitlines(keepends=True):
+        if line.startswith(_HUNK_HEADER_PREFIX):
+            hunks.append([line])
+        elif hunks:
+            hunks[-1].append(line)
+        else:
+            header.append(line)
+    return "".join(header), tuple("".join(hunk) for hunk in hunks)
+
+
+def take_hunks(file_diff: str, budget: int) -> tuple[str, int, int]:
+    """예산 안에 들어가는 hunk 만 파일 순서대로 앞에서 담는다 (C-18).
+
+    반환은 (본문, 담은 hunk 수, 전체 hunk 수). hunk 내부는 절대 자르지 않는다 —
+    잘린 hunk 는 문법이 깨져 모델이 못 읽는다 (PRD 11.1 원칙 6).
+    헤더 + 첫 hunk 조차 예산을 넘으면 ("", 0, 전체) 다: 헤더만 실으면 "파일이 바뀌었다"는
+    사실만 남고 근거는 0 이라 통계 줄과 다를 것이 없다.
+    """
+    header, hunks = split_hunks(file_diff)
+    used = len(header)
+    taken: list[str] = []
+    for hunk in hunks:
+        if used + len(hunk) > budget:
+            break
+        taken.append(hunk)
+        used += len(hunk)
+    if not taken:
+        return "", 0, len(hunks)
+    return header + "".join(taken), len(taken), len(hunks)
+
+
 def build_prompt(
     inp: PromptInput, budget_chars: int = PROMPT_DIFF_BUDGET_CHARS
 ) -> BuiltPrompt:
     """PRD 11.1 원칙 6 의 절단. 변경량 큰 파일부터 diff 전문을 싣는다.
 
-    파일 중간을 자르지 않는 이유: 잘린 hunk 는 문법이 깨져 모델이 무엇이 바뀌었는지
-    읽지 못한다. 통계만 남기는 편이 정보 밀도가 높다. 경로를 잃은 조각은 우선순위
-    최하위로 밀어 다른 파일의 예산을 먹지 않게 한다.
+    경로를 잃은 조각은 우선순위 최하위로 밀어 다른 파일의 예산을 먹지 않게 한다.
+
+    2패스인 이유(C-18): 1패스에 hunk 분할을 섞으면 가장 큰 파일이 남은 예산을 전부 먹어
+    통째로 들어갈 수 있었던 작은 파일들이 통계만 남는다. 먼저 온전히 들어가는 파일을
+    다 싣고, 남은 예산으로 큰 파일의 hunk 를 가져간다.
     """
     stats_by_path = {item.rel_path: item for item in inp.files}
     pieces: list[tuple[int, str, str]] = []
@@ -371,21 +458,41 @@ def build_prompt(
     pieces.sort(key=lambda item: (-item[0], item[1]))
 
     included: list[str] = []
-    omitted: list[str] = []
+    oversized: list[tuple[str, str]] = []
     used = 0
     for _, rel_path, text in pieces:
         if used + len(text) <= budget_chars:
             included.append(text)
             used += len(text)
         else:
+            oversized.append((rel_path, text))
+
+    omitted: list[str] = []
+    partial: list[PartialFile] = []
+    # 앞 조각이 헤더+첫 hunk 조차 못 넣으면 예산이 남아 뒤 조각이 들어갈 수 있다.
+    # 그래서 첫 실패에서 멈추지 않고 전량을 돈다.
+    for rel_path, text in oversized:
+        body, included_hunks, total_hunks = take_hunks(text, budget_chars - used)
+        if included_hunks > 0:
+            included.append(body)
+            used += len(body)
+            partial.append(
+                PartialFile(
+                    rel_path=rel_path or UNKNOWN_PATH_LABEL,
+                    included_hunks=included_hunks,
+                    total_hunks=total_hunks,
+                )
+            )
+        else:
             omitted.append(rel_path or UNKNOWN_PATH_LABEL)
 
     diff_text = "".join(included)
     return BuiltPrompt(
         system=SYSTEM_PROMPT,
-        user=_user_prompt(inp, diff_text, omitted),
-        truncated=bool(omitted),
+        user=_user_prompt(inp, diff_text, omitted, partial),
+        truncated=bool(omitted or partial),
         omitted_files=tuple(omitted),
+        partial_files=tuple(partial),
         diff_chars=len(diff_text),
     )
 
@@ -412,12 +519,13 @@ def _check_str_object(
 
 
 def _clamp_array(
-    values: list[object], label: str, clamped: list[str]
+    values: list[object], label: str, clamped: list[str], *, limit: int
 ) -> list[object]:
-    if len(values) <= MAX_ARRAY_ITEMS:
+    # 상한이 배열마다 다르다 (PRD 11.3) — 호출부가 어느 상한인지 정한다.
+    if len(values) <= limit:
         return values
-    clamped.append(f"{label}: {len(values)}개 -> {MAX_ARRAY_ITEMS}개")
-    return values[:MAX_ARRAY_ITEMS]
+    clamped.append(f"{label}: {len(values)}개 -> {limit}개")
+    return values[:limit]
 
 
 def _clamp_keyword(
@@ -500,7 +608,7 @@ def validate_summary(raw_text: str) -> ValidationOutcome:
                 break
             items.append(checked)
         # 절단을 먼저 한다 — 버려질 항목의 강등까지 soft_clamped 에 남길 이유가 없다.
-        kept = _clamp_array(items, "keywords", clamped)
+        kept = _clamp_array(items, "keywords", clamped, limit=MAX_KEYWORDS)
         doc["keywords"] = [
             _clamp_keyword(entry, f"keywords[{index}]", clamped)
             for index, entry in enumerate(kept)
@@ -515,7 +623,7 @@ def validate_summary(raw_text: str) -> ValidationOutcome:
         if any(not isinstance(entry, str) for entry in raw_list):
             errors.append(f"{key}: 문자열 배열 아님")
             continue
-        doc[key] = _clamp_array(list(raw_list), key, clamped)
+        doc[key] = _clamp_array(list(raw_list), key, clamped, limit=MAX_ARRAY_ITEMS)
 
     flag = parsed.get("sensitive_data_detected")
     if not isinstance(flag, bool):
@@ -611,11 +719,32 @@ def fallback_summary(inp: PromptInput, signatures: Sequence[str]) -> dict[str, o
                 "group": KEYWORD_GROUP_FALLBACK,
                 "confidence": CONFIDENCE_FALLBACK,
             }
-            for signature in list(signatures)[:MAX_ARRAY_ITEMS]
+            # keywords[] 를 채우므로 상한도 keywords 쪽이다.
+            for signature in list(signatures)[:MAX_KEYWORDS]
         ],
         "questions_to_review": [],
         "risks_or_todos": ["모델 요약이 아니라 규칙 기반 요약이므로 내용 확인이 필요합니다."],
         "sensitive_data_detected": False,
+    }
+
+
+def prompt_input_doc(prompt: BuiltPrompt) -> dict[str, object]:
+    """summary.json 과 prompt.json 이 공유하는 `input` 블록.
+
+    두 함수가 각자 조립하면 필드가 늘 때 두 산출물이 조용히 갈라진다.
+    """
+    return {
+        "truncated": prompt.truncated,
+        "omitted_files": list(prompt.omitted_files),
+        "partial_files": [
+            {
+                "path": item.rel_path,
+                "included_hunks": item.included_hunks,
+                "total_hunks": item.total_hunks,
+            }
+            for item in prompt.partial_files
+        ],
+        "diff_chars": prompt.diff_chars,
     }
 
 
@@ -627,14 +756,13 @@ def summary_doc(
     retries: int,
     request_id: str | None,
     generated_at: str,
-    truncated: bool,
-    omitted_files: Sequence[str],
-    diff_chars: int,
+    prompt: BuiltPrompt,
     summary: Mapping[str, object],
 ) -> dict[str, object]:
     """summary.json 본문. 바깥은 메타, `summary` 안쪽이 PRD 11.3 응답 스키마 원형이다.
 
-    5단계 렌더러는 source 만 보고 "LLM 요약 아님"을 표시할 수 있어야 한다 (FR-039).
+    5단계 렌더러는 source 만 보고 "LLM 요약 아님"을, input.truncated 만 보고 "근거가
+    온전하지 않음"을 표시할 수 있어야 한다 (FR-039, PRD 11.4).
     """
     return {
         "schema_version": SUMMARY_SCHEMA_VERSION,
@@ -642,11 +770,7 @@ def summary_doc(
         "source": source,
         "model": model,
         "openai": {"calls": calls, "retries": retries, "request_id": request_id},
-        "input": {
-            "truncated": truncated,
-            "omitted_files": list(omitted_files),
-            "diff_chars": diff_chars,
-        },
+        "input": prompt_input_doc(prompt),
         "summary": dict(summary),
     }
 
@@ -657,11 +781,7 @@ def prompt_doc(prompt: BuiltPrompt, *, generated_at: str, model: str) -> dict[st
         "schema_version": SUMMARY_SCHEMA_VERSION,
         "generated_at": generated_at,
         "model": model,
-        "input": {
-            "truncated": prompt.truncated,
-            "omitted_files": list(prompt.omitted_files),
-            "diff_chars": prompt.diff_chars,
-        },
+        "input": prompt_input_doc(prompt),
         "system": prompt.system,
         "user": prompt.user,
         "response_schema": response_schema(),
@@ -767,9 +887,7 @@ def run_summarize(
                     retries=retries,
                     request_id=response.request_id,
                     generated_at=now(),
-                    truncated=prompt.truncated,
-                    omitted_files=prompt.omitted_files,
-                    diff_chars=prompt.diff_chars,
+                    prompt=prompt,
                     summary=checked.doc,
                 ),
                 calls=calls,
@@ -803,9 +921,7 @@ def run_summarize(
             retries=retries,
             request_id=last.request_id if last is not None else None,
             generated_at=now(),
-            truncated=prompt.truncated,
-            omitted_files=prompt.omitted_files,
-            diff_chars=prompt.diff_chars,
+            prompt=prompt,
             summary=summary,
         ),
         calls=calls,

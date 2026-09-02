@@ -23,10 +23,12 @@
   C-19 실측이 전부 `gpt-4o` 로 난 것이라 **이것이 (2) 의 전제다** — `gpt-4o-mini` 로는
   A 조건 3/3 실패였다,
   (2) **C-19 주행 — 분류 축을 동적 제목으로** (`summarize.py`·`notify.py`).
-  **`dynamic-groups` 로 시작해 design 까지 끝내고 judge 중간에 중단했다 — 5절 (아).**
-  **2026-09-02 사람이 정했다: 1건짜리 묶음은 병합하지 않는다** (PRD **C-20**, v1.5).
-  기존 `DESIGN.md`(macOS) 는 병합을 전제로 섰으므로 폐기하고 **`FRESH_DESIGN=1` 로
-  다시 뽑는다.** PRD 11.2(프롬프트)·11.3·11.4 는 이 커밋에서 이미 고쳤다. **소스는 한 줄도 안 바뀌었다**,
+  **2026-09-02 Windows 에서 2차 주행: design·judge DONE, `JUDGE.md` 게이트에서 대기 중** —
+  5절 (아) 「2차 주행」. 사람이 정할 것 하나: judge 반박 #28 (`MAX_TERM_CHARS` 40→32 의
+  근거 수치 오류. 결론은 유효). **권고는 그대로 승인.** 설계·판정 문서는 `.pipeline/` 이
+  커밋되지 않아 **`docs/pipeline-transfer/dynamic-groups/` 에 사본을 커밋했다** — 다른 PC 에서
+  `.pipeline/dynamic-groups/` 로 복사하면 design($6.04)·judge($7.10)를 다시 태우지 않는다.
+  1건짜리 묶음 병합은 C-20 으로 뺐고 PRD 11.2·11.3·11.4 가 정본이다. **소스는 한 줄도 안 바뀌었다**,
   (3) **하루치 세션 1회** → H1·H3·H4 + 사람 확인 C·D 를 한자리에서 회수 (5절 사. H2 는 닫혔다),
   (4) **F6·F7 주행** — 포맷터 노이즈 필터 + atime 오탐 (`diffgen`+`watcher`. 같은 뿌리다),
   (5) 6단계 통합.
@@ -1874,26 +1876,65 @@ PRD 개정은 끝났다.
   맨 뒤로 보낸다」인데, **레이아웃을 모델 준수에 거는 것**이 오늘 다섯 번 확인된
   "모델은 개수·순서를 못 따른다"와 정면으로 어긋난다는 논거다.
 
-#### 재개 방법 — 설계를 다시 뽑는다 (B)
+#### 2차 주행 (2026-09-02, Windows) — design·judge DONE, `JUDGE.md` 게이트 대기
+
+`FRESH_DESIGN=1 PY=.venv/Scripts/python ./orchestrate.sh dynamic-groups` 로 처음부터 돌렸다.
+PRD v1.6 (C-20·C-21) 이 정본이었다.
+
+| 단계 | 결과 | 턴 | 비용 | 모델 |
+|---|---|---|---|---|
+| design | **DONE** (`DESIGN.md` 352줄) | 19 | **$6.04** | `claude-fable-5` (폴백 없음) |
+| judge 1차 | **사망** — 계정 세션 한도 ("resets 1:30pm"). fable→opus→sonnet 세 번 갈아탔지만 셋 다 같은 한도 | 1 | $0 | — |
+| judge 2차 | **DONE** — `UNVERIFIED: 2 REFUTED: 2` (39건 중 35 확인) | 48 | **$7.10** | `claude-fable-5` |
+
+**한도는 모델별이 아니라 계정 단위였다.** 셸의 폴백 사슬은 과부하·부재용이라 세션 한도에는
+무력하다 — 한도가 풀린 뒤 `FRESH_DESIGN` 없이 재실행하면 DESIGN.md 를 재사용하고 judge 만
+다시 돈다 (이번에 그렇게 했다. 이전 증거는 `judge.attempt1.*`). judge 1차가 만들었던 프로브
+테스트 파일은 스스로 지웠다 — 작업 트리는 깨끗했다.
+
+**설계는 HANDOFF 가 요구한 판정 3건을 전부 답했다** (§7.1 병합·`그 외` 없음 / §6 예산식 /
+§7.3 `실습` 후순위는 렌더러가 강제하지 않는다). 예산식 복구는 **`MAX_TERM_CHARS` 40→32** 하나다 —
+묶음 머리줄 6→14자(+8)를 term 상한 −8 로 정확히 상쇄해 여유 55자가 그대로 남는다. 이 상수는 PRD
+11.3 에 없는 로컬 값이라 PRD 개정 없이 바꿀 수 있는 유일한 항이다. PRD 밖에서 정한 것 셋:
+빈 group → `미분류`, fallback group `기타` → `변경된 선언`, `SUMMARY_SCHEMA_VERSION` 1.3→1.4.
+
+**judge 판정 4건 — 사람이 정할 것은 #28 하나다:**
+
+| # | 판정 | 내용 | 처분 |
+|---|---|---|---|
+| 28 | 반박 | 설계가 "실측 term 최장 13자, 32자는 2배 이상"이라 썼는데 **실측 최장은 20자** (`Object.fromEntries()`, 09-01 오후 세션). 1.6배다 | **결론은 유효** — 32 ≥ 20 이고 넘어도 soft 절단. judge 가 든 대안 `MAX_SYNTAX_CHARS` 44→36 은 **PRD 11.3 명시값**이라 PRD 개정이 먼저 필요 → 채택 불가. **권고: 40→32 그대로 승인.** 설계 문서의 "2배 이상" 문장은 근거 수치만 틀린 것 |
+| 29 | 반박 | 실측 제목 `모듈화와 코드 재사용` 은 10자가 아니라 **11자** | 결론(12자 미만 축소 기각)을 강화하는 방향. 무해 |
+| 33 | 미확인 | strict 스키마가 빈 문자열·길이를 막는지 — 외부 API 표면 | 로컬 clamp 가 양쪽 경우 같은 출력. 영향 없음 |
+| 34 | 미확인 | `DISCORD_CONTENT_LIMIT=2000` — 외부 스펙 | 기존 상수 상속, 관계식 단언. 실전송 204 가 간접 증거 |
+
+#### 재개 방법 — 다른 PC 에서 이어받기 (macOS 포함)
+
+`.pipeline/` 은 커밋되지 않으므로 **`DESIGN.md`·`JUDGE.md` 사본을 `docs/pipeline-transfer/dynamic-groups/`
+에 커밋해 뒀다** (2.1 절이 허용한 「필요한 `.md` 만 따로 옮겨라」의 실행. 주행이 끝나면 이 폴더는
+지운다 — 영구 보관소가 아니다). 승인 마커는 파일 해시에 묶여 있어 내용이 같으면 어느 PC 에서든 유효하다.
 
 ```bash
-# 기존 산출물은 macOS 의 .pipeline/dynamic-groups/ 에만 있다 (커밋되지 않는다 — 2.1 절).
-# 병합을 전제로 선 설계라 폐기 대상이다. 3.6 절 예산 산수만 참고할 가치가 있다.
-cat .pipeline/dynamic-groups/DESIGN.md          # (macOS 에서만) 713줄
+# 1) 사본을 파이프라인 자리로. JUDGE.md 가 DESIGN.md 보다 새 파일이어야 셸이 judge 를 재사용한다
+mkdir -p .pipeline/dynamic-groups
+cp docs/pipeline-transfer/dynamic-groups/DESIGN.md .pipeline/dynamic-groups/
+cp docs/pipeline-transfer/dynamic-groups/JUDGE.md  .pipeline/dynamic-groups/
+touch .pipeline/dynamic-groups/JUDGE.md
 
-# 병합을 뺀 설계를 다시 뽑는다 — PRD v1.5 (C-20) 가 정본이다
-FRESH_DESIGN=1 PY=.venv/bin/python ./orchestrate.sh dynamic-groups
+# 2) JUDGE.md 를 읽고 #28 을 판단한 뒤 사람이 직접 승인한다
+./approve.sh dynamic-groups JUDGE.md
+
+# 3) 재실행 — design·judge 재사용, impl 부터 돈다. FRESH_DESIGN 은 붙이지 마라
+PY=.venv/bin/python ./orchestrate.sh dynamic-groups        # macOS
+PY=.venv/Scripts/python ./orchestrate.sh dynamic-groups    # Windows
 ```
 
-**A 안(`./approve.sh dynamic-groups DESIGN.md`)은 쓰지 마라** — 그 설계는 C-20 과 어긋난다.
-design 한 바퀴($3.65)를 다시 태우는 것이 대가다. Windows PC 에는 `.pipeline/dynamic-groups/`
-가 없으므로 어차피 처음부터 돈다. 새 설계가 이번에 확인할 것: (1) 병합 규칙·`그 외`
-라벨이 **없어야** 한다, (2) 12자 제목이 C-18 예산식을 깨뜨리는 문제를 다뤄야 한다,
-(3) `실습` 후순위를 렌더러가 강제할지 판정해야 한다.
+impl 이 바꿀 파일은 `summarize.py`·`notify.py`·`tests/test_summarize.py`·`tests/test_notify.py`·
+`tests/test_watcher.py`(경미) 다 (DESIGN §3). impl 한 바퀴 실적 $2.6~5.4. verify 뒤 셸이 pytest·ruff·mypy 를
+직접 돌린다. **새 프롬프트 문안(C-20 수정본)은 미실측** — verify 도 실 API 를 못 부르므로 첫 실측은
+구현 뒤 실수업 세션이다 (DESIGN §8 [사람 확인 필요]).
 
-기존 `DESIGN.md` 는 승인 마커가 없다 — `.approved` 파일이 없으므로 `FRESH_DESIGN` 없이
-재실행하면 게이트에서 다시 선다. 중단이 남긴 것은 설계 한 벌과 judge 스트림 조각뿐이고,
-**소스는 한 줄도 안 바뀌었다** (`git status` 깨끗). 되돌릴 것이 없다.
+이전 macOS 설계(713줄, 병합 포함)는 `FRESH_DESIGN=1` 이 덮어썼으므로 그 PC 의 `.pipeline/dynamic-groups/`
+에 남아 있다면 위 1) 의 `cp` 가 갈아끼운다. **소스는 아직 한 줄도 안 바뀌었다.**
 
 
 ### (다) ✅ 해결됨 — cp949 에서 죽는 결함 (0단계 코드)

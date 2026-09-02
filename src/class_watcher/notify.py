@@ -765,7 +765,7 @@ def cleanup_notice(session_root: str, existing_dotenv: Sequence[str]) -> tuple[s
     dotenv = ", ".join(existing_dotenv) if existing_dotenv else "없음"
     return (
         "[정리 안내] 공용 PC 사용 중이라면 종료 전 확인하세요:",
-        f"  {BULLET}세션 산출물: {session_root} - USB 로 옮기거나 삭제",
+        f"  {BULLET}세션 산출물: {session_root} - 보관 여부 확인",
         f"  {BULLET}.env 파일 잔존: {dotenv}",
         f"  {BULLET}환경변수 {ENV_OPENAI_API_KEY} / {ENV_DISCORD_WEBHOOK_URL} 잔존 여부",
     )

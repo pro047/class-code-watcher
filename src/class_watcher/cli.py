@@ -272,7 +272,7 @@ def _print_cleanup_notice(paths: SessionPaths, secrets: Secrets) -> None:
 
 
 def _dotenv_candidates() -> tuple[Path, ...]:
-    """뒤쪽일수록 우선. exe 옆의 `.env` 도 보는 이유는 USB 실행 전제(FR-054) 때문이다."""
+    """뒤쪽일수록 우선. exe 옆의 `.env` 도 보는 이유는 단일 exe 배포(FR-054) 때문이다."""
     candidates: list[Path] = [
         Path(sys.executable).resolve().parent / ".env",
         Path.cwd() / ".env",

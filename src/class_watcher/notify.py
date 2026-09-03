@@ -22,11 +22,11 @@ from .summarize import (
     CONFIDENCE_FALLBACK,
     CONFIDENCE_HIGH,
     CONFIDENCE_LEVELS,
-    KEYWORD_GROUP_FALLBACK,
-    KEYWORD_GROUPS,
+    EMPTY_GROUP_LABEL,
     KEYWORD_ITEM_FIELDS,
     MAX_ARRAY_ITEMS,
     MAX_CONCEPT_CHARS,
+    MAX_GROUP_CHARS,
     MAX_KEYWORDS,
     MAX_SUMMARY_CHARS,
     MAX_SYNTAX_CHARS,
@@ -82,7 +82,8 @@ HEADER_KEYWORDS = "오늘의 키워드"
 HEADER_QUESTIONS = "복습할 질문"
 HEADER_RISKS = "확인할 점"
 
-# PRD 11.4 의 `[객체생성]` 머리줄과 `· {term}  {syntax}` / 두 칸 들여쓴 설명 줄.
+# PRD 11.4 의 `[배열 메소드]` 머리줄과 `· {term}  {syntax}` / 두 칸 들여쓴 설명 줄.
+# 머리줄 안의 제목은 모델이 짓는다 (C-19) — 고정 목록이 없다.
 GROUP_OPEN = "["
 GROUP_CLOSE = "]"
 SYNTAX_GAP = "  "
@@ -108,14 +109,15 @@ def confidence_mark(confidence: str) -> str:
     return "" if level == CONFIDENCE_HIGH else f" ({level})"
 
 
-MAX_GROUP_LABEL = max(len(name) for name in KEYWORD_GROUPS) + len(GROUP_OPEN) + len(GROUP_CLOSE)
+# 제목이 동적이라 목록의 최댓값이 아니라 clamp 상한에서 파생시킨다 (C-19).
+MAX_GROUP_LABEL = MAX_GROUP_CHARS + len(GROUP_OPEN) + len(GROUP_CLOSE)
 MAX_CONFIDENCE_MARK = max(len(confidence_mark(level)) for level in CONFIDENCE_LEVELS)
 
 # 키워드 한 건이 첫 화면에서 먹는 최악 문자수. 최악은 2건이 서로 다른 분류에 들어가
 # 그룹 머리줄을 각각 한 줄씩 쓰는 경우라, 그룹 머리줄을 건당으로 센다.
 KEYWORD_BLOCK_MAX = (
     1  # 분류 사이 빈 줄
-    + MAX_GROUP_LABEL + 1  # "[객체생성]"
+    + MAX_GROUP_LABEL + 1  # "[배열 메소드]"
     + len(BULLET) + MAX_TERM_CHARS + MAX_CONFIDENCE_MARK
     + len(SYNTAX_GAP) + MAX_SYNTAX_CHARS + 1  # 키워드 줄
     + len(CONCEPT_INDENT) + MAX_CONCEPT_CHARS + 1  # 설명 줄
@@ -354,17 +356,19 @@ def _render_keywords(block: object) -> tuple[RenderKeyword, ...]:
 def group_keywords(
     keywords: Sequence[RenderKeyword],
 ) -> tuple[tuple[str, tuple[RenderKeyword, ...]], ...]:
-    """분류별 묶음. KEYWORD_GROUPS 순서 고정, 빈 분류는 빠진다 (PRD 11.4).
+    """묶음 순서 = 모델이 낸 첫 등장 순서 (PRD 11.4, C-19). 고정 순서가 없다.
 
-    KEYWORD_GROUPS 밖의 group 은 KEYWORD_GROUP_FALLBACK 버킷으로 흡수한다 — 렌더가
-    키워드를 조용히 떨어뜨리는 경로를 만들지 않는다. 전송은 성공하고 메시지만 비는
-    실패는 게이트가 못 잡기 때문이다 (validate_summary 의 강등에 이은 2차 그물).
+    병합하지 않는다 (C-20) — 1건짜리 묶음도 제 제목 그대로 나간다. 합친 묶음에 붙일
+    정직한 이름이 없기 때문이다. 어떤 group 문자열도 흡수·강등 없이 제 이름으로
+    렌더하므로 렌더가 키워드를 조용히 떨어뜨리는 경로가 없다 — 전송은 성공하고 메시지만
+    비는 실패는 게이트가 못 잡는다.
     """
-    buckets: dict[str, list[RenderKeyword]] = {name: [] for name in KEYWORD_GROUPS}
+    buckets: dict[str, list[RenderKeyword]] = {}
     for keyword in keywords:
-        name = keyword.group if keyword.group in buckets else KEYWORD_GROUP_FALLBACK
-        buckets[name].append(keyword)
-    return tuple((name, tuple(buckets[name])) for name in KEYWORD_GROUPS if buckets[name])
+        # 빈 제목은 4단계 clamp 가 이미 걸렀다. 여기 오는 것은 옛 doc·손으로 고친 doc 뿐이다.
+        name = keyword.group if keyword.group.strip() else EMPTY_GROUP_LABEL
+        buckets.setdefault(name, []).append(keyword)
+    return tuple((name, tuple(items)) for name, items in buckets.items())
 
 
 def _render_strings(block: object) -> tuple[str, ...]:
@@ -448,7 +452,10 @@ def render_message(inp: RenderInput) -> str:
     if inp.keywords:
         lines.extend(["", HEADER_KEYWORDS])
         for group, items in group_keywords(inp.keywords):
-            lines.extend(["", f"{GROUP_OPEN}{group}{GROUP_CLOSE}"])
+            # 제목이 모델 자유 문자열이 된 뒤로는(C-19) 머리줄도 sanitize 를 거친다 —
+            # 4단계 clamp 를 안 탄 doc 에 대한 2차 방어선이다 (FR-051).
+            head = sanitize_line(group, limit=MAX_GROUP_CHARS)
+            lines.extend(["", f"{GROUP_OPEN}{head}{GROUP_CLOSE}"])
             for keyword in items:
                 lines.extend(_keyword_lines(keyword))
     if inp.questions:

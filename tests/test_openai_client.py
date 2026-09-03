@@ -92,5 +92,28 @@ def test_sdk_auto_retry_is_disabled() -> None:
     assert openai_client.OPENAI_MAX_RETRIES == 0
 
 
-def test_timeout_is_15_seconds() -> None:
-    assert openai_client.OPENAI_TIMEOUT_S == 15.0
+def test_timeout_is_90_seconds() -> None:
+    # PRD 7절 (C-22) "각 외부 요청 타임아웃 90초". 15초는 하루치 세션(41KB diff)에서
+    # 반드시 openai_timeout 으로 죽는 것이 실측됐고, 90 은 성공이 실측된 유일한 값이다.
+    # 값 단언이 약한 테스트임을 알지만 PRD 정본 값의 회귀 방지가 목적이다.
+    assert openai_client.OPENAI_TIMEOUT_S == 90.0
+
+
+def test_client_is_created_with_the_timeout_and_no_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 상수가 90 이어도 클라이언트 생성에 전달되지 않으면 SDK 기본값(600초)이 산다.
+    captured: dict[str, object] = {}
+
+    class _FakeOpenAI:
+        def __init__(self, *, api_key: str, timeout: float, max_retries: int) -> None:
+            captured["api_key"] = api_key
+            captured["timeout"] = timeout
+            captured["max_retries"] = max_retries
+
+    monkeypatch.setattr(openai_client, "OpenAI", _FakeOpenAI)
+
+    openai_client.make_openai_caller("sk-test", "gpt-4o")
+
+    assert captured["timeout"] == openai_client.OPENAI_TIMEOUT_S == 90.0
+    assert captured["max_retries"] == openai_client.OPENAI_MAX_RETRIES == 0

@@ -76,8 +76,35 @@ def test_is_success_accepts_only_2xx(status: int, expected: bool) -> None:
 
 
 def test_timeout_matches_prd_seven() -> None:
-    # PRD 7절 "각 외부 요청 타임아웃 15초".
-    assert discord_client.DISCORD_TIMEOUT_S == 15.0
+    # PRD 7절 (C-22) "각 외부 요청 타임아웃 90초" — "각 외부 요청"이 두 클라이언트
+    # 모두를 가리킨다.
+    assert discord_client.DISCORD_TIMEOUT_S == 90.0
+
+
+def test_client_is_created_with_the_90_second_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 상수가 90 이어도 httpx.Client 생성에 전달되지 않으면 httpx 기본값(5초)이 산다.
+    timeouts: list[float] = []
+
+    class _Client:
+        def __init__(self, *, timeout: float) -> None:
+            timeouts.append(timeout)
+
+        def __enter__(self) -> "_Client":
+            return self
+
+        def __exit__(self, *exc_info: object) -> bool:
+            return False
+
+        def post(self, url: str, *, json: object) -> _FakeResponse:
+            return _FakeResponse(204)
+
+    monkeypatch.setattr(discord_client.httpx, "Client", _Client)
+    send = discord_client.make_discord_sender(WEBHOOK)
+
+    assert send({"content": "안녕"}) == 204
+    assert timeouts == [discord_client.DISCORD_TIMEOUT_S] == [90.0]
 
 
 # ── 케이스 21: httpx 예외를 종류로 환원 ───────────────────────────────────────

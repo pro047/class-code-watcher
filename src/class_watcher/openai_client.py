@@ -30,8 +30,10 @@ from .summarize import (
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 ENV_OPENAI_MODEL = "OPENAI_MODEL"
 
-# PRD 7절 "각 외부 요청 타임아웃 15초". SDK 기본값은 600초라 명시가 필수다.
-OPENAI_TIMEOUT_S = 15.0
+# PRD 7절 "각 외부 요청 타임아웃 90초" (C-22). SDK 기본값은 600초라 명시가 필수다.
+# 15초는 하루치 세션에서 반드시 죽는다 — 2026-09-02 실측(41KB diff)이 openai_timeout 이었고
+# 같은 입력을 90초로 준 스크립트만 성공했다. 90 은 성공이 실측된 유일한 값이다.
+OPENAI_TIMEOUT_S = 90.0
 
 # SDK 기본값은 자동 재시도 2회다. 그대로 두면 FR-030 의 계수 밖에서 호출이 늘어난다.
 OPENAI_MAX_RETRIES = 0

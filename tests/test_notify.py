@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 
 from class_watcher import notify
-from class_watcher.summarize import KEYWORD_GROUPS
 
 STARTED_AT = "2026-08-26T18:30:00+09:00"
 ENDED_AT = "2026-08-26T20:29:00+09:00"
@@ -74,13 +73,15 @@ def _render_input(
 def _max_keyword(index: int) -> notify.RenderKeyword:
     """모든 문자열 필드가 상한이고 confidence 표기가 가장 긴 키워드 한 건.
 
-    분류를 6종에 흩뿌린다 — 분류가 갈릴수록 그룹 머리줄이 늘어 렌더가 길어진다.
+    group 은 건마다 서로 다른 12자 제목이다 (C-19) — C-20 이후 「키워드 15건 =
+    1건짜리 묶음 15개」가 정당한 모델 출력이라, 건마다 그룹 머리줄이 한 줄씩 붙는
+    것이 최악치다. 6종에 뭉치면 머리줄이 6줄만 생겨 최악치를 재지 못한다.
     """
     return notify.RenderKeyword(
-        term="용" * 40,
-        syntax="s" * 44,
-        concept="설" * 90,
-        group=KEYWORD_GROUPS[index % len(KEYWORD_GROUPS)],
+        term="용" * notify.MAX_TERM_CHARS,
+        syntax="s" * notify.MAX_SYNTAX_CHARS,
+        concept="설" * notify.MAX_CONCEPT_CHARS,
+        group="제" * (notify.MAX_GROUP_CHARS - 2) + f"{index:02d}",
         confidence="medium",
     )
 
@@ -101,13 +102,24 @@ def _worst_case_input(*, keyword_count: int = 15) -> notify.RenderInput:
     )
 
 
+# C-19/C-23 실측(sessions/c19-send-170949.json)에서 모델이 실제로 지은 제목 부류다.
+REALISTIC_GROUPS: tuple[str, ...] = (
+    "배열 메소드",
+    "문자열 처리",
+    "날짜 처리",
+    "수학 처리",
+    "JSON 처리",
+    "실습",
+)
+
+
 def _realistic_keyword(index: int) -> notify.RenderKeyword:
     """PRD 11.4 예시 정도 길이의 키워드. 상한이 아니라 실제로 나오는 값이다."""
     return notify.RenderKeyword(
         term=f"프로토타입 체인{index}",
         syntax="Object.getPrototypeOf()",
         concept="객체가 상위 객체의 속성을 찾아 올라가는 구조다.",
-        group=KEYWORD_GROUPS[index % len(KEYWORD_GROUPS)],
+        group=REALISTIC_GROUPS[index % len(REALISTIC_GROUPS)],
         confidence="high" if index % 2 == 0 else "medium",
     )
 
@@ -230,7 +242,7 @@ def test_long_keyword_fields_are_clamped_with_truncation_mark() -> None:
                 term="가" * 300,
                 syntax="나" * 300,
                 concept="다" * 300,
-                group="기타",
+                group="문자열 처리",
                 confidence="high",
             ),
         ),
@@ -259,10 +271,12 @@ def test_confidence_mark_is_shown_for_everything_but_high() -> None:
     assert notify.confidence_mark("아무거나\n+주입") == " (low)"
 
 
-# ── 분류별 묶음 (PRD 11.4) ───────────────────────────────────────────────────
+# ── 동적 묶음 (PRD 11.4, C-19/C-20) ──────────────────────────────────────────
 
 
-def test_group_keywords_follows_the_group_table_order_and_drops_empty_ones() -> None:
+def test_group_keywords_follows_first_appearance_order() -> None:
+    # 설계 §8 테스트 17: 묶음 순서 = 모델이 낸 첫 등장 순서. 고정 분류표는 삭제됐다
+    # (C-19). 같은 제목만 한 버킷이고, 떨어져 등장해도 첫 등장 위치로 모인다.
     keywords = (
         notify.RenderKeyword("a", "", "설명", "연산자", "high"),
         notify.RenderKeyword("b", "", "설명", "객체생성", "high"),
@@ -271,19 +285,111 @@ def test_group_keywords_follows_the_group_table_order_and_drops_empty_ones() -> 
 
     grouped = notify.group_keywords(keywords)
 
-    assert [name for name, _ in grouped] == ["객체생성", "연산자"]
-    assert [item.term for item in grouped[1][1]] == ["a", "c"]
+    assert [name for name, _ in grouped] == ["연산자", "객체생성"]
+    assert [item.term for item in grouped[0][1]] == ["a", "c"]
+    assert [item.term for item in grouped[1][1]] == ["b"]
 
 
-def test_unknown_group_is_absorbed_instead_of_being_dropped() -> None:
-    # 렌더가 키워드를 조용히 떨어뜨리면 전송은 성공하고 메시지만 비는 실패가 된다 —
-    # 게이트가 못 잡는 종류라 2차 그물을 둔다.
+def test_unknown_group_keeps_its_own_name_without_absorption() -> None:
+    # 설계 §8 테스트 18: 흡수·강등이 없다 (C-19 — 「기타」 개념 자체가 삭제됐다).
+    # 렌더가 키워드를 조용히 떨어뜨리면 전송은 성공하고 메시지만 비는 실패가 된다.
     keywords = (notify.RenderKeyword("a", "", "설명", "없는분류", "high"),)
 
     grouped = notify.group_keywords(keywords)
 
-    assert [name for name, _ in grouped] == [notify.KEYWORD_GROUP_FALLBACK]
-    assert grouped[0][1][0].term == "a"
+    assert grouped == (("없는분류", keywords),)
+
+
+def test_every_keyword_survives_grouping_and_rendering() -> None:
+    # 설계 §8 테스트 18 (무손실): 미지의 제목 15종이 전부 제 이름의 묶음으로 렌더되고
+    # 입력 키워드 수 == 렌더된 키워드 수다.
+    keywords = tuple(
+        notify.RenderKeyword(f"용어{index}", "", "설명", f"묶음{index}", "high")
+        for index in range(15)
+    )
+    inp = _render_input(keywords=keywords, questions=(), risks=())
+
+    text = notify.render_message(inp)
+
+    heads = [line for line in text.split("\n") if line.startswith(notify.BULLET)]
+    assert len(heads) == len(keywords)
+    for index in range(15):
+        assert f"{notify.GROUP_OPEN}묶음{index}{notify.GROUP_CLOSE}" in text
+
+
+def test_single_item_group_is_not_merged_away() -> None:
+    # 설계 §8 테스트 19 (C-20): 1건짜리 묶음도 병합 없이 제 제목으로 렌더된다.
+    # 합친 묶음에 붙일 정직한 이름이 없다 — 「그 외」 라벨도 없다.
+    keywords = (
+        notify.RenderKeyword("a", "", "설명", "배열 메소드", "high"),
+        notify.RenderKeyword("b", "", "설명", "혼자인 묶음", "high"),
+    )
+
+    text = notify.render_message(_render_input(keywords=keywords, questions=(), risks=()))
+
+    assert f"{notify.GROUP_OPEN}배열 메소드{notify.GROUP_CLOSE}" in text
+    assert f"{notify.GROUP_OPEN}혼자인 묶음{notify.GROUP_CLOSE}" in text
+    assert "그 외" not in text
+
+
+@pytest.mark.parametrize("group", ["", "   "])
+def test_blank_group_renders_under_the_unclassified_label(group: str) -> None:
+    # 설계 §8 테스트 20: 4단계 clamp 를 안 거친 doc(옛 형식·손으로 고친 것)의 빈 제목은
+    # `[]` 가 아니라 `[미분류]` 로 렌더된다.
+    keywords = (notify.RenderKeyword("a", "", "설명", group, "high"),)
+
+    text = notify.render_message(_render_input(keywords=keywords, questions=(), risks=()))
+
+    assert f"{notify.GROUP_OPEN}{notify.EMPTY_GROUP_LABEL}{notify.GROUP_CLOSE}" in text
+    assert f"{notify.GROUP_OPEN}{notify.GROUP_CLOSE}" not in text
+
+
+def test_hostile_group_strings_stay_inside_the_second_defence_line() -> None:
+    # 설계 §8 테스트 21 (FR-051): group 에 개행·`+` 접두·13자 이상, syntax 에 `-` 로
+    # 시작하는 슬래시 나열을 넣어도 렌더 전체에 diff 라인이 없고 머리줄이 14자 이내다.
+    keywords = (
+        notify.RenderKeyword(
+            term="용어",
+            syntax="- floor/ceil/round/trunc/sign",
+            concept="설명",
+            group="+열두 자를 훌쩍 넘는\n악의적 묶음 제목",
+            confidence="high",
+        ),
+    )
+
+    plan = notify.plan_message(_render_input(keywords=keywords, questions=(), risks=()))
+
+    assert notify.find_diff_lines(plan.text) == ()
+    for chunk in plan.chunks:
+        assert notify.find_diff_lines(chunk) == ()
+    [head] = [
+        line
+        for line in plan.text.split("\n")
+        if line.startswith(notify.GROUP_OPEN) and line.endswith(notify.GROUP_CLOSE)
+    ]
+    assert len(head) <= notify.MAX_GROUP_LABEL == 14
+
+
+def test_group_label_budget_derives_from_the_dynamic_clamp() -> None:
+    # C-19: 예산의 그룹 머리줄 폭이 삭제된 enum 최장 이름이 아니라 12자 clamp 에서
+    # 파생된다. 이 파생이 끊기면 아래 D 절 관계식이 가정 위에 서게 된다.
+    derived = notify.MAX_GROUP_CHARS + len(notify.GROUP_OPEN) + len(notify.GROUP_CLOSE)
+    assert derived == notify.MAX_GROUP_LABEL
+
+
+def test_shrunk_top_two_keywords_keep_both_dynamic_groups() -> None:
+    # 설계 §8 테스트 24: keywords 축소(앞 2건) 후에도 상위 2건이 서로 다른 동적 제목이면
+    # 두 묶음이 다 렌더된다 — 묶음은 절단 뒤에 일어난다.
+    inp = _worst_case_input()
+    first, second = inp.keywords[0].group, inp.keywords[1].group
+    assert first != second
+
+    reduced, shrunk = notify.shrink(inp, limit=600, max_chunks=2)
+
+    assert "keywords" in shrunk
+    text = notify.render_message(reduced)
+    assert f"{notify.GROUP_OPEN}{first}{notify.GROUP_CLOSE}" in text
+    assert f"{notify.GROUP_OPEN}{second}{notify.GROUP_CLOSE}" in text
 
 
 # ── 첫 화면 보장과 축소·분할 (FR-050 x FR-033) ───────────────────────────────
@@ -610,17 +716,46 @@ def test_full_message_fits_the_real_two_chunk_capacity() -> None:
 
 def test_worst_case_never_collapses_keywords_to_two() -> None:
     # D4: PRD 11.3 이 경고한 실패 — "상한을 없애면 키워드가 많이 나온 날 오히려 2개짜리
-    # 메시지가 나간다". MAX_ITEM_CHARS 가 없으면 상한 15 에서도 이 붕괴가 도달 가능하다.
+    # 메시지가 나간다". C-19 의 진짜 최악(1건짜리 묶음 15개 + 질문·확인까지 전부 상한)
+    # 에서도 keywords 는 축소되지 않고 15건 전부 전송 조각에 실린다.
+    # 주의: 이 입력은 문자 예산(설계 §6, 3,933 <= 3,988) 안이지만 줄 경계 분할의
+    # 낭비 때문에 질문 바닥 줄이 3번째 조각으로 밀려 하드 절단될 수 있다 — 그 경우
+    # truncated 플래그와 안내문이 사실을 표시한다 (VERIFY.md 발견 사항 참고).
     plan = notify.plan_message(_worst_case_input())
 
     assert "keywords" not in plan.shrunk_sections
     assert len(plan.chunks) <= notify.MAX_CHUNKS
-    assert plan.truncated is False
     for chunk in plan.chunks:
         assert len(chunk) <= notify.DISCORD_CONTENT_LIMIT
     heads = [line for line in plan.text.split("\n") if line.startswith(notify.BULLET)]
-    # 키워드 15건의 머리줄 + 축소 후 남은 질문 1건.
     assert len([line for line in heads if line.startswith(notify.BULLET + "용")]) == 15
+    # 렌더 전체본만이 아니라 실제 전송 조각에도 15건 전부 실린다 — 붕괴 없음의 실증.
+    assert "\n".join(plan.chunks).count(notify.BULLET + "용") == 15
+
+
+def test_fifteen_single_keyword_groups_at_full_width_fit_two_chunks() -> None:
+    # 설계 §8 테스트 23: 최악 키워드 입력(서로 다른 12자 제목 15개 = 1건짜리 묶음
+    # 15개, term 16 · syntax 60 · concept 90 전부 상한, 제목·요약 상한, 표시 두 줄
+    # 동시 참)이 축소 없이 MAX_CHUNKS 이내로 나간다 — C-18 「상한 15 에서 붕괴 없음」이
+    # 새 상수(C-23 맞교환)에서도 성립하는 직접 증거.
+    inp = _render_input(
+        title="제" * 300,
+        summary="요" * notify.MAX_SUMMARY_CHARS,
+        keywords=tuple(_max_keyword(index) for index in range(15)),
+        questions=("오늘 배운 것 중 무엇을 복습해야 하는가?",),
+        risks=(),
+        rule_based=True,
+        truncated=True,
+    )
+
+    plan = notify.plan_message(inp)
+
+    assert plan.shrunk_sections == ()
+    assert plan.truncated is False
+    assert len(plan.chunks) <= notify.MAX_CHUNKS
+    for chunk in plan.chunks:
+        assert len(chunk) <= notify.DISCORD_CONTENT_LIMIT
+    assert plan.text.count(notify.BULLET + "용") == 15
 
 
 def test_realistic_fifteen_keywords_fit_one_chunk_without_shrinking() -> None:
@@ -654,7 +789,7 @@ def test_render_shows_at_most_fifteen_keywords() -> None:
                     "term": f"키워드{index}",
                     "syntax": "",
                     "concept": "설명",
-                    "group": "기타",
+                    "group": "배열 메소드",
                     "confidence": "high",
                 }
                 for index in range(16)

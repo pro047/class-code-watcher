@@ -925,7 +925,8 @@ VALID_SUMMARY_TEXT = json.dumps(
                 "term": "대입 연산자",
                 "concept": "변수에 값을 넣는 연산자다.",
                 "syntax": "=",
-                "group": "연산자",
+                # C-19: 모델이 짓는 동적 제목이다 — 구 6종 enum 에 없던 값이 그대로 흐른다.
+                "group": "변수와 대입",
                 "confidence": "high",
             }
         ],
@@ -1509,7 +1510,7 @@ def test_delivered_payload_carries_no_diff_lines_or_evidence(
                     "term": "- 대입 연산자",
                     "concept": "--- a/a.py 를 고쳤다",
                     "syntax": "+=",
-                    "group": "연산자",
+                    "group": "변수와 대입",
                     "confidence": "high",
                     # 스키마 밖 필드. 4단계 검증도 5단계 렌더도 읽지 않는다.
                     "evidence": f"--- a/a.py\n{leaked}",

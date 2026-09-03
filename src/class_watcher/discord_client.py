@@ -24,8 +24,8 @@ from .notify import (
     SendFn,
 )
 
-# PRD 7절 "각 외부 요청 타임아웃 15초".
-DISCORD_TIMEOUT_S = 15.0
+# PRD 7절 "각 외부 요청 타임아웃 90초" (C-22). "각 외부 요청"이 두 클라이언트 모두를 가리킨다.
+DISCORD_TIMEOUT_S = 90.0
 
 
 def is_success(status: int) -> bool:

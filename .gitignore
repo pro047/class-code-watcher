@@ -19,3 +19,6 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+
+# 실험 요약 산출물 (세션마다 새로 생긴다)
+experiments/summary_v2/out/

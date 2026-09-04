@@ -30,7 +30,12 @@ def load_env() -> dict[str, str]:
 
 def schema() -> dict:
     def obj(props: dict) -> dict:
-        return {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
+        return {
+            "type": "object",
+            "properties": props,
+            "required": list(props),
+            "additionalProperties": False,
+        }
 
     s = {"type": "string"}
     arr = lambda item: {"type": "array", "items": item}  # noqa: E731
@@ -54,7 +59,8 @@ def user_prompt(doc: dict, diff: str, title: str) -> str:
     lines = [
         f"세션 제목(참고용, 내용과 다를 수 있음): {title}",
         f"수업 시간: {st} ~ {en}",
-        f"변경 파일 {len(files)}개, +{cs.get('added_lines', '?')} / -{cs.get('deleted_lines', '?')}",
+        f"변경 파일 {len(files)}개, "
+        f"+{cs.get('added_lines', '?')} / -{cs.get('deleted_lines', '?')}",
         *(f"- {p}" for p in files),
         "",
         "<diff>",
@@ -65,7 +71,11 @@ def user_prompt(doc: dict, diff: str, title: str) -> str:
 
 
 def render_md(d: dict, session_id: str, model: str) -> str:
-    out = [f"# {d['title']}", "", f"_세션 {session_id} · 모델 {model}_", "", "## 오늘 배운 것", "", d["summary"], ""]
+    out = [
+        f"# {d['title']}", "",
+        f"_세션 {session_id} · 모델 {model}_", "",
+        "## 오늘 배운 것", "", d["summary"], "",
+    ]
     if d["pitfalls"]:
         out += ["## 꼭 기억할 함정", ""]
         for i, p in enumerate(d["pitfalls"], 1):
@@ -88,7 +98,7 @@ def render_md(d: dict, session_id: str, model: str) -> str:
         out += ["## 오늘의 실습 (다시 풀어보기)", ""]
         for i, q in enumerate(d["practice"], 1):
             q_lines = q["question"].splitlines()
-            out += [f"{i}. {q_lines[0]}"] + [f"   {l}" for l in q_lines[1:]]
+            out += [f"{i}. {q_lines[0]}"] + [f"   {line}" for line in q_lines[1:]]
             if q["hint"]:
                 out += [f"   - 힌트: {q['hint']}"]
         out += [""]
@@ -108,7 +118,8 @@ def main() -> int:
     root = SESSIONS / a.session_id
     doc = json.loads((root / "session.json").read_text(encoding="utf-8"))
     diff = (root / "final.diff").read_text(encoding="utf-8")
-    red = json.loads((root / "redaction.json").read_text(encoding="utf-8")) if (root / "redaction.json").exists() else {}
+    red_path = root / "redaction.json"
+    red = json.loads(red_path.read_text(encoding="utf-8")) if red_path.exists() else {}
     if red.get("secrets_found"):
         sys.exit("redaction.json 에 비밀정보 탐지 기록이 있어 원본 diff 를 보내지 않는다.")
 
@@ -123,14 +134,19 @@ def main() -> int:
     resp = client.chat.completions.create(
         model=model,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        response_format={"type": "json_schema", "json_schema": {"name": "lesson_note_v2", "strict": True, "schema": schema()}},
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "lesson_note_v2", "strict": True, "schema": schema()},
+        },
         temperature=0.2,
     )
     data = json.loads(resp.choices[0].message.content or "{}")
     usage = resp.usage
     out_dir = HERE / "out"
     out_dir.mkdir(exist_ok=True)
-    (out_dir / f"{a.session_id}.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / f"{a.session_id}.json").write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     md = render_md(data, a.session_id, resp.model)
     (out_dir / f"{a.session_id}.md").write_text(md, encoding="utf-8")
     print(f"model={resp.model} in={usage.prompt_tokens} out={usage.completion_tokens} "

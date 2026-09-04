@@ -170,9 +170,60 @@ if have_detach; then
   got=0
   detach ./approve.sh feat DESIGN.md >/dev/null 2>&1 || got=$?
   if [ "$got" -ne 0 ] && [ ! -f .pipeline/feat/DESIGN.md.approved ]; then
-    green "  PASS  approve.sh 는 tty 없이 마커를 만들지 않는다"; PASS=$((PASS+1))
+    green "  PASS  approve.sh 는 tty 없이(중계 없이) 마커를 만들지 않는다"; PASS=$((PASS+1))
   else
     red   "  FAIL  tty 없는 approve — exit=$got$([ -f .pipeline/feat/DESIGN.md.approved ] && echo ', 마커 생성됨')"; FAIL=$((FAIL+1))
+  fi
+  teardown
+
+  # ── y 중계 (2026-09-04 사용자 결정): 런처는 사람의 답을 그대로 넘긴다. y 만 승인이다.
+  setup
+  mkdir -p .pipeline/feat
+  printf 'STATUS: DONE\n' > .pipeline/feat/DESIGN.md
+  got=0
+  detach ./approve.sh feat DESIGN.md --relayed y >/dev/null 2>&1 || got=$?
+  if [ "$got" -eq 0 ] \
+     && [ "$(cat .pipeline/feat/DESIGN.md.approved)" = "$(./approve.sh --hash .pipeline/feat/DESIGN.md)" ] \
+     && grep -q '런처 중계' .pipeline/feat/APPROVALS.md 2>/dev/null; then
+    green "  PASS  --relayed y 는 tty 없이 마커를 만들고 감사 기록을 남긴다"; PASS=$((PASS+1))
+  else
+    red   "  FAIL  y 중계 — exit=$got, 마커=$([ -f .pipeline/feat/DESIGN.md.approved ] && echo O || echo X)"; FAIL=$((FAIL+1))
+  fi
+  teardown
+
+  setup
+  mkdir -p .pipeline/feat
+  printf 'STATUS: DONE\n' > .pipeline/feat/DESIGN.md
+  bad=0
+  for ans in n "" "괜찮으면 해" yes; do
+    got=0
+    detach ./approve.sh feat DESIGN.md --relayed "$ans" >/dev/null 2>&1 || got=$?
+    { [ "$got" -eq 0 ] || [ -f .pipeline/feat/DESIGN.md.approved ]; } && { bad=1; echo "         통과시킨 답: '$ans' (exit $got)"; }
+  done
+  if [ "$bad" -eq 0 ]; then
+    green "  PASS  y 가 아닌 중계 답(n·빈 값·문장·yes)은 마커를 만들지 않는다"; PASS=$((PASS+1))
+  else
+    red   "  FAIL  중계가 y 이외의 답을 승인으로 받았다"; FAIL=$((FAIL+1))
+  fi
+  teardown
+
+  # 중계 마커가 실제 게이트를 통과시키고, STATE 의 다음 행동이 중계 계약을 담는지.
+  setup
+  seed_design_judge "중계 승인 대상 설계"
+  got=0
+  detach env FAKE_SCENARIO=ok AUTO=0 TEST_CMD=true ./orchestrate.sh feat >/dev/null 2>&1 || got=$?
+  first=$got
+  has_protocol=0
+  grep -q -- '--relayed y' .pipeline/feat/STATE.md 2>/dev/null \
+    && grep -q 'AskUserQuestion' .pipeline/feat/STATE.md 2>/dev/null \
+    && grep -q '요약·추천·의견 금지' .pipeline/feat/STATE.md 2>/dev/null && has_protocol=1
+  detach ./approve.sh feat DESIGN.md --relayed y >/dev/null 2>&1 || true
+  got=0
+  detach env FAKE_SCENARIO=ok AUTO=0 TEST_CMD=true ./orchestrate.sh feat >/dev/null 2>&1 || got=$?
+  if [ "$first" -eq 4 ] && [ "$has_protocol" -eq 1 ] && [ "$got" -eq 0 ] && [ -f .pipeline/feat/IMPL.md ]; then
+    green "  PASS  exit 4 의 다음 행동이 y 중계 계약이고, 중계 마커로 게이트를 통과한다"; PASS=$((PASS+1))
+  else
+    red   "  FAIL  y 중계 게이트 — 1차=$first (기대 4), 계약=$has_protocol, 2차=$got (기대 0)"; FAIL=$((FAIL+1))
   fi
   teardown
 else

@@ -391,10 +391,13 @@ EOF
   mv "$artifact" "$parked"
   log "  ⚠ 프로세스는 죽었으나 산출물은 STATUS: DONE — $parked 로 파킹"
 
+  # 파킹본의 승인 명령은 마커가 아니라 mv 다. 마커로 되살리면 "승인했다"와 "제자리에
+  # 있다"가 분리돼 다음 실행의 재사용 로직이 마커 없는 파일을 집는 경로가 생긴다.
+  # design·judge 는 재사용 로직이 집고, impl·verify 는 단계가 다시 돈다.
   gate_human \
     "죽은 이유: $reason. 산출물이 온전해 보이는데 신뢰할까? (y = 제자리로 되돌리고 진행)" \
     "$parked" 1 \
-    "검토 후 mv '$parked' '$artifact' 하고 재실행 — mv 라는 행위 자체가 승인이다 (design·judge 는 재사용 로직이 집고, impl·verify 는 단계가 다시 돈다). 되살리지 않으면 파킹된 채로 남는다"
+    "mv '$parked' '$artifact'"
 
   # 여기 도달 = 사람이 y 를 눌렀거나 유효한 승인 마커가 있었다.
   mv "$parked" "$artifact"
@@ -577,20 +580,25 @@ EOF
 }
 
 # ─────────────────────────────────────────── 사람 게이트
-# 상담역은 여기에 손댈 수 없다. 오직 사람만 누른다.
-# gate_human <메시지> <검토파일> [force] [승인방법]
+# 상담역은 여기에 손댈 수 없다. 판단은 사람만 한다.
+# gate_human <메시지> <검토파일> [force] [승인명령]
 #
-# 4번째 인자는 tty 없는 경로(exit 4)에서 "사람이 무엇을 해야 승인인가"를 바꾼다.
-# 기본은 approve.sh 마커지만, 파킹된 산출물처럼 마커로 되살릴 수 없는 게이트도 있다.
+# 4번째 인자는 tty 없는 경로(exit 4)에서 "사람이 y 라고 답하면 실행할 명령"이다.
+# 기본은 approve.sh 마커(--relayed)지만, 파킹된 산출물은 mv 가 승인이다.
+#
+# 런처 모드의 승인 계약 (2026-09-04 사용자 결정): 메인 세션은 **판단 금지**다.
+# 파일을 보여주고 "승인? (y/n)" 하나만 물은 뒤, 사람이 정확히 y 라고 답했을 때만
+# 아래 승인명령을 실행한다. 요약·추천·"괜찮아 보인다"는 계약 위반이다 — 사람이
+# 요약만 읽고 y 를 누르는 순간 이 게이트는 텍스트 규칙이 된다 (design-notes §7).
 #
 # force=1 이면 AUTO=1 이어도 멈춘다. 검증되지 않은 주장을 무인으로 통과시키면
 # 이 파이프라인이 막으려는 것(근거 없는 판단이 구현까지 흘러가는 것)이 그대로
 # 일어난다 — 무인 모드는 "게이트를 없앤다"가 아니라 "판정 가능한 것만 자동으로
 # 넘긴다"는 뜻이다.
 gate_human() {
-  local msg=$1 file=$2 force=${3:-0} approve_how=${4:-}
-  [ -n "$approve_how" ] \
-    || approve_how="$ROOT/approve.sh $FEATURE $(basename "$file") 실행 (승인 후 재실행하면 마커로 통과 — 내용이 바뀌면 무효)"
+  local msg=$1 file=$2 force=${3:-0} approve_cmd=${4:-}
+  [ -n "$approve_cmd" ] \
+    || approve_cmd="$ROOT/approve.sh $FEATURE $(basename "$file") --relayed y"
 
   # 승인 마커: 사람이 approve.sh 로 "이 내용을 검토했다"를 남긴 것.
   # 해시로 내용에 묶여 있어 승인 후 파일이 바뀌면 무효가 된다.
@@ -626,14 +634,14 @@ EOF
   local ans; read -r ans < /dev/tty || ans=__NO_TTY__
   case "$ans" in
     y|Y) return 0 ;;
-    e|E) "${EDITOR:-less}" "$file"; gate_human "$msg" "$file" "$force" "$approve_how" ;;
+    e|E) "${EDITOR:-less}" "$file"; gate_human "$msg" "$file" "$force" "$approve_cmd" ;;
     __NO_TTY__)
       state "AWAITING_APPROVAL" "$msg — $(basename "$file")" \
-        "1) $file 을 사람에게 보여줘라. 2) 승인은 사람만 한다 — 사람이 직접 $approve_how. 런처가 대신 실행하거나 승인 파일을 직접 쓰는 것은 금지다. 3) 승인 뒤 같은 명령으로 재실행하면 이 게이트를 통과한다."
+        "1) $file 의 내용을 사람에게 **그대로** 보여줘라 — 요약·추천·의견 금지, 판단은 사람이 한다. 2) AskUserQuestion 으로 \"승인? (y/n)\" 하나만 물어라. 3) 사람의 답이 정확히 y 일 때만 실행: $approve_cmd  — y 가 아닌 답(\"알아서\", \"괜찮으면\")은 승인이 아니다. 다시 묻거나 중단을 보고해라. 4) 승인 뒤 같은 명령으로 재실행하면 이 게이트를 통과한다. 승인 기록은 $WORK/APPROVALS.md 에 남는다."
       {
         printf '\033[1;33m[승인 대기]\033[0m tty 가 없어 게이트에서 멈춘다 (exit 4)\n'
         printf '  검토 대상: %s\n' "$file"
-        printf '  승인 방법: 검토한 사람이 터미널에서 직접 %s\n' "$approve_how"
+        printf '  승인 명령: 사람이 y 라고 답한 뒤 %s\n' "$approve_cmd"
         printf '  자세한 안내는 %s 의 "다음 행동" 블록에 있다\n' "$STATE"
       } >&2
       exit 4 ;;

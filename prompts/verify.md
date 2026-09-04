@@ -6,7 +6,9 @@
 $WORK/VERIFY.md
 
 ## 산출물 외에 수정해도 되는 것
-- `$ROOT/tests/test_*.py` — 테스트 파일 (신규 작성·기존 수정)
+- DESIGN.md 의 `ALLOWED_FILES` 에 있는 **테스트 파일만** (`$ROOT/tests/test_*.py`).
+  셸이 `git status` 와 그 목록을 대조한다 — 목록에 없는 테스트 파일을 새로 만들면
+  파이프라인이 죽는다. 필요한 파일이 목록에 없으면 STATUS: BLOCKED 로 올려라.
 
 ## 입력 (읽기만, 절대 수정 금지)
 - `$WORK/DESIGN.md` — "검증 기준" 섹션이 테스트의 근거다

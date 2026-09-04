@@ -1,7 +1,7 @@
 # 핸드오프 — Class Code Watcher
 
 - 기준 문서: `PRD.md` **v1.7** (14절 MVP 단계별 개발 계획, C-17·C-18·C-19·C-20·C-21·C-22·C-23 반영)
-- 갱신 시점: 2026-09-03
+- 갱신 시점: 2026-09-04 (F16 — 요약 프롬프트 v2 실험 반영. 그 밖은 09-03 기준)
 - 기준 커밋: **이 문서가 마지막으로 커밋된 시점의 main** — `git log -1 --oneline -- HANDOFF.md`
   로 확인한다. 해시를 본문에 박으면 커밋하는 순간 한 커밋 뒤처진다(2026-08-30 에 두 번 겪었다)
 - 게이트 3종 녹색: **452 passed** / ruff clean / mypy 17 files
@@ -780,10 +780,42 @@ impl 과 verify 를 나눈 이유가 그건데 거기서 한 번 무너졌다.
 | **F1 한계** | hunk **하나**가 예산을 넘을 때의 최후 수단이 없다. hunk 내부 절단이냐 통계 강등이냐 — **미결정** | `summarize` |
 | **F10** | `summary` 의 역할이 프롬프트에 없다. 길이 제한만 있고 keywords 와의 관계가 없어 열거가 섞인다 | `summarize` |
 | **F13** | 프롬프트가 「전부 뽑아라」라고 말한 적이 없었다 — **C-19 문안이 넣었으나 미실측** | `summarize` |
+| **F16** | **요약이 키워드 목록으로는 맞지만 복습 교재로는 얇다.** 선생님이 주석에 적어 둔 함정·실습 문제가 통째로 빠지고 근거 없는 조언이 그 자리를 채운다. **F10·F13 을 포함하는 더 큰 결함이다** — 아래 별도 항목 | `summarize` + `notify` |
 
 > **F6 과 F7 은 같은 뿌리다** — 둘 다 「저장됐다」와 「달라졌다」를 구분하지 않아서 생긴다.
 > F6 은 내용이 바뀌었지만 의미가 없는 경우, F7 은 내용조차 안 바뀐 경우다.
 > **한 주행에서 함께 다루는 것이 자연스럽다.**
+
+**F16 — 요약 프롬프트 v2 실험이 이미 있다 (2026-09-04, `0e69284`)**
+
+> **먼저 이것부터 읽어라.** F10·F13 을 새로 파기 전에 `experiments/summary_v2/` 를 봐라.
+> 같은 뿌리를 이미 한 번 팠고, 실측이 나와 있다. 모르고 다시 시작하면 하루를 버린다.
+
+`experiments/summary_v2/prompt_v2.md` + `run.py`. 본 파이프라인을 건드리지 않고 세션의
+`final.diff` 를 다시 요약해 `out/` 에 JSON·Markdown 을 뽑는다. **자체 채점 현행 60점 → v2 82점**
+(같은 세션, `gpt-4o`). 점수는 자체 채점이라 `추정`이고, **제품 경로를 탄 적이 없다.**
+
+v2 가 강제하는 것 — 주석을 코드보다 먼저 읽고 「오류·예외·주의·못하·false 반환」이 든 줄은
+전부 함정으로 / `api_inventory` 를 먼저 나열한 뒤 `keywords` 가 그것을 빠짐없이 덮게 /
+키워드 `concept` 은 2문장 강제 / 실습 문제의 데이터 블록은 한 글자도 빼지 말고 그대로 /
+diff 에 근거 없는 조언 금지.
+
+**승격이 왜 별도 작업인가 — 스키마가 깨진다** (`summarize.py:259` 대조):
+
+| | 현행 (PRD 11.3) | v2 |
+|---|---|---|
+| 신규 | — | `api_inventory[]`, `pitfalls[{title, explanation, code_example}]`, `practice[{question, hint}]`, `keywords[].code_example` |
+| 사라짐 | `change_stats`, `confidence`, `sensitive_data_detected`, `risks_or_todos` | (`risks_or_todos` → `notes`) |
+| 이름 | `session_title`, `questions_to_review` | `title`, `review_questions` |
+
+그래서 승격에는 **네 가지가 함께** 간다: ① `response_schema()` ② `validate_summary` 의
+필드별 clamp ③ `notify` 의 Discord 렌더링 ④ **길이 예산 재산정** — `summarize.py:38` 의
+`고정부 + MAX_KEYWORDS * KEYWORD_BLOCK_MAX <= DISCORD_CONTENT_LIMIT * MAX_CHUNKS` 는
+`pitfalls`·`practice` 를 모르는 식이다. **`추정`: 이 둘이 들어가면 현행 상한으로는 넘친다.**
+
+**주의 — `confidence` 를 빼면 잃는 것이 있다.** 이 문서 머리말이 「모델이 diff 밖 일반론을
+채운다」를 뒤집은 근거가 실수업 세션에서 `confidence` 가 처음 갈렸다(high 3 / medium 2)는
+것이었다. v2 스키마에는 그 필드가 없다. **뺄지 말지는 결정 사항이지 생략이 아니다.**
 
 **사람만 닫을 수 있는 것** — 5절 (가) 가 정본이다. 남은 것: 1단계 4번(`Z:` 실세션, 학원
 PC 에서만) · 5단계 **B**(분할 — 자연 트리거 불가, 상수를 임시로 낮춰야 한다) ·

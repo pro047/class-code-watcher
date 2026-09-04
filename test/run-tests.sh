@@ -531,7 +531,7 @@ echo "=== 모델 교체 감시 ==="
 setup
 env FAKE_SCENARIO=model_swap AUTO=1 TEST_CMD="true" \
   ./orchestrate.sh feat >/dev/null 2>&1
-if grep -q '요청 claude-fable-5 → 실제 claude-opus-4-8' .pipeline/feat/MODEL_LOG.md 2>/dev/null; then
+if grep -q '요청 claude-fable-5-1 → 실제 claude-opus-4-8' .pipeline/feat/MODEL_LOG.md 2>/dev/null; then
   green "  PASS  다른 모델이 돌면 MODEL_LOG 에 기록된다"; PASS=$((PASS+1))
 else
   red   "  FAIL  모델 교체가 기록되지 않음"
@@ -684,7 +684,7 @@ if have_detach; then
   setup
   detach_pm env FAKE_SCENARIO_DESIGN=crash_swapped AUTO=1 TEST_CMD=true \
     ./orchestrate.sh feat >/dev/null 2>&1 || true
-  if grep -q '요청 claude-fable-5 → 실제 claude-opus-4-8' .pipeline/feat/MODEL_LOG.md 2>/dev/null; then
+  if grep -q '요청 claude-fable-5-1 → 실제 claude-opus-4-8' .pipeline/feat/MODEL_LOG.md 2>/dev/null; then
     green "  PASS  크래시 경로에서도 모델 교체가 MODEL_LOG 에 남는다"; PASS=$((PASS+1))
   else
     red   "  FAIL  크래시 시 모델 교체 미기록"; sed 's/^/         /' .pipeline/feat/MODEL_LOG.md 2>/dev/null; FAIL=$((FAIL+1))

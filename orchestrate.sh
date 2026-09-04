@@ -112,11 +112,11 @@ VERIFY_FAILED=""
 #
 # FALLBACK_* 은 가용성 폴백(529 과부하 등) 전용이다.
 # 안전 분류기에 의한 모델 교체는 이걸로 막을 수 없다 — MODEL_LOG.md 로 감시한다.
-MODEL_DESIGN="${MODEL_DESIGN:-claude-fable-5}"
+MODEL_DESIGN="${MODEL_DESIGN:-claude-fable-5-1}"
 # 판단 검증은 설계를 반박하는 일이라 verify 와 같은 적대적 추론이다. 상위 모델.
-MODEL_JUDGE="${MODEL_JUDGE:-claude-fable-5}"
+MODEL_JUDGE="${MODEL_JUDGE:-claude-fable-5-1}"
 MODEL_IMPL="${MODEL_IMPL:-claude-opus-5}"
-MODEL_VERIFY="${MODEL_VERIFY:-claude-fable-5}"
+MODEL_VERIFY="${MODEL_VERIFY:-claude-fable-5-1}"
 
 FALLBACK_DESIGN="${FALLBACK_DESIGN:-claude-opus-5,claude-sonnet-5}"
 FALLBACK_JUDGE="${FALLBACK_JUDGE:-claude-opus-5,claude-sonnet-5}"

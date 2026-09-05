@@ -24,6 +24,12 @@
 #   impl_protected   구현이 보호 파일(.gitignore)을 수정함 — 보호 파일 게이트가 막아야 정상
 #   verify_protected 검증이 보호 파일을 고쳐 테스트를 무르게 만듦 — 같은 게이트
 #   design_overwrite 구현이 승인된 DESIGN.md 를 덮어씀 — 산출물 지문 게이트가 막아야 정상
+#   verify_edits_source 검증이 ALLOWED_FILES 안의 **소스**(x.txt)를 고침 — 단계별 쓰기 게이트가 막아야 정상
+#   verify_edits_test   검증이 TEST_FILES 안의 테스트 파일(t.test.txt)을 씀 — 대조군, 완주해야 정상
+#   impl_edits_test     구현이 TEST_FILES 안의 테스트 파일을 고침 — 같은 게이트가 막아야 정상
+#   impl_edits_source   구현이 소스(x.txt)를 고침 — 대조군, 완주해야 정상
+#   (FAKE_NO_TEST_FILES=1) 설계가 TEST_FILES 블록을 빼먹음 — 계약 게이트가 막아야 정상
+#   (FAKE_TEST_FILES="…")  설계의 TEST_FILES 블록 내용. 기본은 빈 블록
 #   junk_stream   스트림에 JSON 아닌 줄이 섞임 — 관용 파싱으로 완주해야 정상
 #   judge_clean   판단 검증이 미확인·반박 0 으로 통과
 #   judge_flagged 판단 검증이 반박을 올림 (사람 게이트가 떠야 정상)
@@ -122,6 +128,12 @@ write_artifact() {  # write_artifact <status-block>
       echo "ALLOWED_FILES:"
       for f in ${FAKE_ALLOWED:-x.txt}; do echo "- $f"; done
       echo
+      # 단계별 쓰기 게이트가 읽는 블록. FAKE_NO_TEST_FILES=1 이면 빼먹은 설계를 흉내낸다.
+      if [ "${FAKE_NO_TEST_FILES:-0}" != "1" ]; then
+        echo "TEST_FILES:"
+        for f in ${FAKE_TEST_FILES:-}; do echo "- $f"; done
+        echo
+      fi
     fi
   } > "$ARTIFACT"
 }
@@ -235,6 +247,29 @@ UNVERIFIED: 2 REFUTED: 1"
     write_artifact "STATUS: DONE"
     # 구현이 입력 파일을 산출물로 착각해 덮어쓰는 실패 모드 (design-notes §6)
     [ "$STAGE" = "IMPL" ] && echo "(impl 이 덧붙임)" >> "$(dirname "$ARTIFACT")/DESIGN.md"
+    emit false "$MODEL" ;;
+
+  verify_edits_source)
+    write_artifact "STATUS: DONE"
+    # 검증이 테스트를 통과시키려고 소스를 땜질하는 실패 모드. x.txt 는 ALLOWED_FILES 안에
+    # 있으므로 범위 게이트는 통과한다 — 단계별 쓰기 게이트만이 잡을 수 있다.
+    [ "$STAGE" = "VERIFY" ] && echo "(verify 가 소스를 고침)" >> "${ROOT:-.}/x.txt"
+    emit false "$MODEL" ;;
+
+  verify_edits_test)
+    write_artifact "STATUS: DONE"
+    [ "$STAGE" = "VERIFY" ] && echo "(verify 가 테스트를 씀)" >> "${ROOT:-.}/t.test.txt"
+    emit false "$MODEL" ;;
+
+  impl_edits_test)
+    write_artifact "STATUS: DONE"
+    # 구현이 기존 테스트를 고쳐 통과시키는 실패 모드 (impl.md 가 "가장 나쁜 실패 모드"라 부르는 것)
+    [ "$STAGE" = "IMPL" ] && echo "(impl 이 테스트를 고침)" >> "${ROOT:-.}/t.test.txt"
+    emit false "$MODEL" ;;
+
+  impl_edits_source)
+    write_artifact "STATUS: DONE"
+    [ "$STAGE" = "IMPL" ] && echo "(impl 이 소스를 고침)" >> "${ROOT:-.}/x.txt"
     emit false "$MODEL" ;;
 
   impl_fail)

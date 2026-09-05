@@ -124,26 +124,35 @@ ADD_DIRS="${ADD_DIRS:-}"
 # ── 모델 티어링 ──────────────────────────────────────
 # 별칭 대신 풀 ID를 박는다. 별칭은 어느 날 조용히 다른 모델을 가리킨다.
 #
-#   설계  : 최상위. 여기가 틀리면 뒤가 전부 낭비다.
-#   판단검증: 최상위. 설계를 반박하는 일이라 verify 와 같은 적대적 추론이다.
+#   설계  : 상위(Opus). 2026-09-05 최상위에서 내림 — Opus 설계 3주행 재시도 0건, 재가격 $4.38→$2.59.
+#   판단검증: 최상위(Fable). 설계를 반박하는 일이고, 설계와 **다른 모델**이 감사해야 맹점을
+#           공유하지 않는다 (design-notes §6). 유일하게 최상위를 남기는 자리다.
 #   구현  : 설계가 확정돼 있으면 난이도가 내려간다. 중간 티어로 충분.
-#   검증  : 다시 최상위. "설계에서 벗어난 지점 찾기"는 적대적 추론이라 구현보다 어렵다.
+#   검증  : 상위(Opus). 2026-09-05 최상위에서 내림. **Opus 검증 품질은 미측정**(과거 8건 전부
+#           Fable) — 3주행 뒤 재판단. 되돌리려면 MODEL_VERIFY=claude-fable-5-1.
+#
+# 근거는 실적 재가격이다 (2026-09-05, 45 단계주행). Fable→Opus 는 단계당 42% 절감이지 50% 가
+# 아니다 — 캐시 읽기 단가($0.25 vs $0.50)가 반대 방향이라서다. 전체 주행 기준 $13.1 → $9.9.
+# effort 는 이 변경과 분리해서 다음 단계에 잰다 — 두 변수를 같이 바꾸면 절감 출처를 못 가른다.
 #
 # FALLBACK_* 은 가용성 폴백(529 과부하 등) **그리고** 레이트리밋 순환 체인이다.
 # --fallback-model 은 과부하·부재만 받고 창 소진 거부는 셸이 감지해 다음 항목으로
 # 갈아탄다 (rate_limited 참조). 안전 분류기에 의한 모델 교체는 둘 다로 막을 수 없다 —
 # MODEL_LOG.md 로 감시한다.
-MODEL_DESIGN="${MODEL_DESIGN:-claude-fable-5-1}"
+MODEL_DESIGN="${MODEL_DESIGN:-claude-opus-5}"
 MODEL_JUDGE="${MODEL_JUDGE:-claude-fable-5-1}"
-MODEL_IMPL="${MODEL_IMPL:-claude-opus-5}"   # 이 저장소의 선택 (design-notes §9)
-MODEL_VERIFY="${MODEL_VERIFY:-claude-fable-5-1}"
+MODEL_IMPL="${MODEL_IMPL:-claude-sonnet-5}"
+MODEL_VERIFY="${MODEL_VERIFY:-claude-opus-5}"
 
-# 폴백은 티어를 내리지 않는다. 구현 주 모델이 이미 중간 티어라 아래로 갈 곳이 없고,
-# 과부하 때 하위 티어로 떨어뜨리면 산출물 품질이 조용히 무너진다 — 그래서 위로 올린다.
-FALLBACK_DESIGN="${FALLBACK_DESIGN:-claude-opus-5,claude-sonnet-5}"
+# 폴백은 먼저 **위**로 간다. 과부하 때 하위 티어로 떨어뜨리면 산출물 품질이 조용히 무너진다.
+# 체인 끝의 sonnet 은 두 풀이 다 소진됐을 때 죽는 대신 돌리는 최후 수단이다 — FAIL_LOG 집계
+# (2026-09-05) 에서 Fable 리밋 5건·Opus 리밋 5건, 양쪽 풀이 다 막힌다. 주 모델이 Opus 인
+# 단계의 첫 폴백이 Fable 인 이유: 리밋으로 갈아탄 주행은 Fable 값을 내지만, 버려진 부분
+# 주행보다 싸다. 판단검증은 이미 최상위라 갈 곳이 아래뿐이다.
+FALLBACK_DESIGN="${FALLBACK_DESIGN:-claude-fable-5-1,claude-sonnet-5}"
 FALLBACK_JUDGE="${FALLBACK_JUDGE:-claude-opus-5,claude-sonnet-5}"
-FALLBACK_IMPL="${FALLBACK_IMPL:-claude-sonnet-5}"   # MODEL_IMPL 이 opus-5 라 한 단 아래로
-FALLBACK_VERIFY="${FALLBACK_VERIFY:-claude-opus-5,claude-sonnet-5}"
+FALLBACK_IMPL="${FALLBACK_IMPL:-claude-opus-5}"
+FALLBACK_VERIFY="${FALLBACK_VERIFY:-claude-fable-5-1,claude-sonnet-5}"
 
 # ── 단계별 상한 ──────────────────────────────────────
 # 턴 상한은 무한루프 탈출용이다. 실적보다 넉넉히 둔다 — 2026-08-31 실측: 40턴 시절
@@ -663,14 +672,35 @@ EOF
 # extract_allowed_files 는 gate_scope 와 "승인 직후 훅 연동" 두 곳에서 쓴다. 로직을
 # 두 벌로 두면 한쪽만 고쳐졌을 때 게이트가 판정하는 목록과 훅이 허용하는 목록이
 # 갈라진다 — 그때 증상은 "설계에 있는 파일인데 거부됨"이라 원인을 찾기 어렵다.
-extract_allowed_files() {
-  local out=$1
+extract_block() {   # extract_block <블록 헤더> <출력파일>
   # grep 은 매치가 0건이면 exit 1 이다. set -e 아래에서 그건 "계약이 비었다"가 아니라
   # "스크립트 사망"으로 나타난다 — 판정하기 전에 죽으므로 반드시 감싼다.
   set +e
-  sed -n '/^ALLOWED_FILES:/,/^[[:space:]]*$/p' "$WORK/DESIGN.md" \
-    | grep '^- ' | sed -e 's/^- *//' -e 's|^\./||' | sort -u > "$out"
+  sed -n "/^$1:/,/^[[:space:]]*$/p" "$WORK/DESIGN.md" \
+    | grep '^- ' | sed -e 's/^- *//' -e 's|^\./||' | sort -u > "$2"
   set -e
+}
+extract_allowed_files() { extract_block ALLOWED_FILES "$1"; }
+extract_test_files()    { extract_block TEST_FILES    "$1"; }
+
+# ─────────────────────────────────────────── 계약 형식 게이트
+# 설계 직후, judge 를 띄우기 **전에** 두 블록의 형식을 본다 — 여기서 죽으면 judge 비용이 안 든다.
+# ALLOWED_FILES 는 범위 게이트가, TEST_FILES 는 단계별 쓰기 게이트가 읽는다. 둘 다 사람용
+# 표가 아니라 기계용 블록이고, 없으면 게이트가 "이탈 0개"로 조용히 통과시키므로 없음=위반이다.
+# TEST_FILES 는 비어 있어도 된다(테스트 없는 설계) — 헤더 자체는 있어야 한다.
+gate_contract() {
+  local allowed="$WORK/.contract_allowed" tests="$WORK/.contract_tests" stray
+  extract_allowed_files "$allowed"
+  [ -s "$allowed" ] \
+    || die "design: DESIGN.md 에 ALLOWED_FILES 블록이 없다 — 범위를 계약으로 만들 수 없다 (prompts/design.md 참조)"
+  grep -q '^TEST_FILES:' "$WORK/DESIGN.md" \
+    || die "design: DESIGN.md 에 TEST_FILES 블록이 없다 — 어느 단계가 어느 파일을 고쳐도 되는지 가를 수 없다 (prompts/design.md 참조)"
+  extract_test_files "$tests"
+  stray="$(comm -13 "$allowed" "$tests")"
+  [ -z "$stray" ] \
+    || die "design: TEST_FILES 에 ALLOWED_FILES 밖의 파일이 있다: $(printf '%s' "$stray" | tr '\n' ' ')— 두 블록은 부분집합 관계여야 한다"
+  log "  ✔ 계약 형식 (허용 $(wc -l < "$allowed" | tr -d ' ')개 · 테스트 $(wc -l < "$tests" | tr -d ' ')개)"
+  rm -f "$allowed" "$tests"
 }
 
 gate_scope() {
@@ -715,15 +745,24 @@ gate_scope() {
 # **기준선을 찍는 위치가 곧 검사 범위다.** 기준선 이전의 변경은 흡수돼 영원히 안 잡힌다.
 # 그래서 첫 run_stage 보다 앞에서 찍고, 설계 게이트 통과 직후 산출물을 목록에 넣으며 한 번
 # 다시 찍는다 (그 사이 변경은 design·judge 뒤의 check_protected 가 이미 봤다).
-protected_fingerprint() {
+# fingerprint_paths <경로...> — 저장소 루트 기준 상대 경로마다 "경로 해시" 한 줄. 없는 파일은 "(없음)".
+# 보호 파일 게이트와 단계별 쓰기 게이트가 같은 함수를 쓴다 — 지문 형식이 두 벌이면 한쪽만 고쳐진다.
+fingerprint_paths() {
   local f
-  for f in $PROTECTED_FILES $ARTIFACT_GUARD; do
+  for f in "$@"; do
     if [ -f "$ROOT/$f" ]; then
       printf '%s %s\n' "$f" "$(file_hash "$ROOT/$f")"
     else
       printf '%s (없음)\n' "$f"
     fi
   done
+}
+protected_fingerprint() { fingerprint_paths $PROTECTED_FILES $ARTIFACT_GUARD; }
+
+# changed_paths <기준선> <현재> — 두 지문 사이에서 달라진 경로(생성·삭제 포함)를 한 줄에 하나씩.
+changed_paths() {
+  diff <(printf '%s\n' "$1") <(printf '%s\n' "$2") \
+    | grep '^[<>]' | awk '{print $2}' | sort -u || true
 }
 
 PROTECTED_BASELINE=""
@@ -732,10 +771,38 @@ PROTECTED_BASELINE=""
 # 매 단계 직후에 부른다. 늦게 볼수록 그 위에 코드와 테스트가 쌓여 되돌리는 비용이 올라간다.
 check_protected() {
   local stage=$1 changed
-  changed="$(diff <(printf '%s\n' "$PROTECTED_BASELINE") <(protected_fingerprint) \
-             | grep '^[<>]' | awk '{print $2}' | sort -u | tr '\n' ' ' || true)"
+  changed="$(changed_paths "$PROTECTED_BASELINE" "$(protected_fingerprint)" | tr '\n' ' ')"
   [ -z "$changed" ] \
     || die "$stage 단계가 보호 파일을 수정함: $changed — git checkout 으로 되돌린 뒤 설계부터 다시 볼 것 (의도한 변경이면 PROTECTED_FILES 에서 빼고 재실행)"
+}
+
+# ─────────────────────────────────────────── 단계별 쓰기 권한 게이트
+# 범위 게이트(ALLOWED_FILES)는 "어느 파일이 바뀌어도 되는가"만 본다. "**누가** 바꿔도 되는가"는
+# 모른다 — 그래서 검증이 소스를 땜질해 테스트를 통과시키는 것과 구현이 테스트를 깎아 통과시키는
+# 것이 둘 다 목록 안에서 일어나며 범위 게이트를 그대로 지난다. 프롬프트가 둘 다 금지하지만
+# 프롬프트는 게이트가 아니다 (2026-09-04 분석 — verify 스트림 13개에서 사건 0건이었으나
+# 게이트가 잡은 0 이 아니라 아직 안 일어난 0 이었다).
+#
+# 판정: DESIGN.md 의 TEST_FILES 블록이 테스트 파일이고, 나머지 ALLOWED_FILES 가 소스다.
+#   impl   → 테스트 파일을 바꾸면 위반
+#   verify → 소스 파일을 바꾸면 위반
+# git status 가 아니라 지문인 이유: 재시도 2차의 impl 은 1차 verify 가 남긴 테스트 파일을
+# 워킹트리에서 본다. "지금 더러운가"가 아니라 "**이 단계가** 바꿨는가"를 봐야 하므로 기준선을
+# 단계 직전에 찍는다. 이름 패턴(test_*.py 등)으로 가르지 않는 이유는 저장소마다 규칙이 달라
+# 패턴이 자라고, 안 걸리는 픽스처 하나에서 오탐이 나기 때문이다 — 설계가 명시한다.
+#
+# stage_baseline  — ALLOWED_FILES 전체의 지문. 단계 직전에 찍는다.
+# check_stage_writes <단계> <기준선> <금지목록파일> <설명> — 바뀐 파일 ∩ 금지목록이 비어야 통과.
+stage_baseline() { fingerprint_paths $(cat "$WORK/allowed_files.txt"); }
+
+check_stage_writes() {
+  local stage=$1 baseline=$2 forbidden=$3 what=$4 changed bad count
+  changed="$(changed_paths "$baseline" "$(stage_baseline)")"
+  bad="$(comm -12 <(printf '%s\n' "$changed" | sort -u) <(sort -u "$forbidden"))"
+  [ -n "$bad" ] || { log "  ✔ $stage 쓰기 권한 준수 ($what 미변경)"; return 0; }
+  count=$(printf '%s\n' "$bad" | wc -l | tr -d ' ')
+  printf '%s\n' "$bad" | fail_log "$stage 단계가 $what 를 수정함 (${count}개)"
+  die "$stage 단계가 $what 를 수정함: $(printf '%s' "$bad" | tr '\n' ' ')— 이 단계의 권한 밖이다. impl 이면 테스트를 고쳐 통과시킨 것이고 verify 면 소스를 고쳐 통과시킨 것이다 → $FAIL_LOG"
 }
 
 # ─────────────────────────────────────────── 검증 실행
@@ -846,6 +913,8 @@ else
 fi
 # design.md 가 "읽기만, 절대 수정 금지"로 못박지만 프롬프트는 게이트가 아니다.
 check_protected design
+# 계약 블록의 형식은 judge 를 띄우기 전에 본다 — 형식 위반에 judge 비용을 얹을 이유가 없다.
+gate_contract
 
 # ─────────────────────────────────────────── 판단 검증
 # 설계의 '주장'을 별 프로세스가 감사한다. 구현물에는 테스트·게이트가 있는데
@@ -903,6 +972,10 @@ extract_allowed_files "$WORK/allowed_files.txt"
 export PIPELINE_APPROVED_SCOPE="$WORK/allowed_files.txt"
 log "승인 범위 $(wc -l < "$WORK/allowed_files.txt" | tr -d ' ')개 파일을 훅에 전달 (PIPELINE_APPROVED_SCOPE)"
 
+# 단계별 쓰기 권한의 근거도 같은 승인본에서 뽑는다. 소스 = 허용 − 테스트.
+extract_test_files "$WORK/test_files.txt"
+comm -23 "$WORK/allowed_files.txt" "$WORK/test_files.txt" > "$WORK/source_files.txt"
+
 while :; do
   ATTEMPT=$((ATTEMPT + 1))
   log "── 시도 $ATTEMPT/$((MAX_RETRY + 1))"
@@ -916,18 +989,24 @@ while :; do
     log "↺ RESUME_FROM=verify — impl 건너뜀 (기존 IMPL.md 재사용, 보호 파일 git 대조 통과)"
     state "REUSED:impl" "RESUME_FROM=verify — 기존 IMPL.md 재사용"
   else
+    # 기준선은 impl **직전**에 찍는다 — 재시도 2차는 1차 verify 의 테스트 변경을 이미 안고 시작한다.
+    IMPL_BASELINE="$(stage_baseline)"
     run_stage impl   "$MODEL_IMPL"   "$FALLBACK_IMPL"   "$PROMPTS/impl.md"   "$WORK/IMPL.md"
     gate_scope impl
     # 구현 직후에 검사한다. 검증 단계까지 흘려보내면 그 위에 테스트가 쌓여서
     # 되돌리는 비용이 올라간다.
     check_protected impl
+    check_stage_writes impl "$IMPL_BASELINE" "$WORK/test_files.txt" "테스트 파일"
   fi
 
+  VERIFY_BASELINE="$(stage_baseline)"
   run_stage verify "$MODEL_VERIFY" "$FALLBACK_VERIFY" "$PROMPTS/verify.md" "$WORK/VERIFY.md"
   gate_scope verify
   # 검증 단계도 같은 검사를 받는다. 통과시키려고 러너 설정을 손대는 것이 가장 값싼
   # 부정행위 경로다.
   check_protected verify
+  # 그다음으로 값싼 경로가 소스 땜질이다 — 테스트 파일 밖은 verify 의 권한이 아니다.
+  check_stage_writes verify "$VERIFY_BASELINE" "$WORK/source_files.txt" "소스 파일"
 
   # ★ 최종 판정은 셸이 한다. 에이전트에게 안 맡긴다.
   state "TESTING" "$TEST_CMD"

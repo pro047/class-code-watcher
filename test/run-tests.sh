@@ -63,7 +63,7 @@ expect() {
 # 설계·판정이 이미 있는 상태를 만든다 (설계 게이트·재사용 케이스용)
 seed_design_judge() {   # seed_design_judge [설계 본문]
   mkdir -p .pipeline/feat
-  printf 'STATUS: DONE\n\n(%s)\n\nALLOWED_FILES:\n- x.txt\n\n' "${1:-사람이 이미 검토한 설계}" > .pipeline/feat/DESIGN.md
+  printf 'STATUS: DONE\n\n(%s)\n\nALLOWED_FILES:\n- x.txt\n\nTEST_FILES:\n\n' "${1:-사람이 이미 검토한 설계}" > .pipeline/feat/DESIGN.md
   sleep 1
   printf 'STATUS: DONE\nUNVERIFIED: 0 REFUTED: 0\n' > .pipeline/feat/JUDGE.md
 }
@@ -247,7 +247,7 @@ setup
 mkdir -p .pipeline/feat
 printf 'STATUS: DONE\nUNVERIFIED: 0 REFUTED: 0\n\n(지난 판정)\n' > .pipeline/feat/JUDGE.md
 sleep 1
-printf 'STATUS: DONE\n\n(새 설계)\n\nALLOWED_FILES:\n- x.txt\n\n' > .pipeline/feat/DESIGN.md
+printf 'STATUS: DONE\n\n(새 설계)\n\nALLOWED_FILES:\n- x.txt\n\nTEST_FILES:\n\n' > .pipeline/feat/DESIGN.md
 env FAKE_SCENARIO=ok AUTO=1 TEST_CMD="true" ./orchestrate.sh feat >/dev/null 2>&1
 if [ -f .pipeline/feat/judge.result.json ]; then
   green "  PASS  설계가 판정보다 새로우면 판단 검증을 다시 돌린다"; PASS=$((PASS+1))
@@ -391,7 +391,7 @@ echo "=== 설계 재사용 ==="
 # 이미 DONE 인 DESIGN.md 가 있으면 설계 단계를 아예 호출하지 않아야 한다
 setup
 mkdir -p .pipeline/feat
-printf 'STATUS: DONE\n\n(사람이 이미 검토한 설계)\n\nALLOWED_FILES:\n- x.txt\n\n' > .pipeline/feat/DESIGN.md
+printf 'STATUS: DONE\n\n(사람이 이미 검토한 설계)\n\nALLOWED_FILES:\n- x.txt\n\nTEST_FILES:\n\n' > .pipeline/feat/DESIGN.md
 env FAKE_SCENARIO=ok AUTO=1 TEST_CMD="true" ./orchestrate.sh feat >/dev/null 2>&1
 if [ ! -f .pipeline/feat/design.result.json ] \
    && grep -q '사람이 이미 검토한 설계' .pipeline/feat/DESIGN.md \
@@ -404,7 +404,7 @@ teardown
 
 setup
 mkdir -p .pipeline/feat
-printf 'STATUS: DONE\n\n(사람이 이미 검토한 설계)\n\nALLOWED_FILES:\n- x.txt\n\n' > .pipeline/feat/DESIGN.md
+printf 'STATUS: DONE\n\n(사람이 이미 검토한 설계)\n\nALLOWED_FILES:\n- x.txt\n\nTEST_FILES:\n\n' > .pipeline/feat/DESIGN.md
 env FAKE_SCENARIO=ok AUTO=1 FRESH_DESIGN=1 TEST_CMD="true" ./orchestrate.sh feat >/dev/null 2>&1
 if [ -f .pipeline/feat/design.result.json ]; then
   green "  PASS  FRESH_DESIGN=1 이면 설계를 다시 뽑는다"; PASS=$((PASS+1))
@@ -468,7 +468,7 @@ echo "=== 모델 교체 감시 ==="
 setup
 env FAKE_SCENARIO=model_swap AUTO=1 TEST_CMD="true" \
   ./orchestrate.sh feat >/dev/null 2>&1
-if grep -q '요청 claude-fable-5-1 → 실제 claude-opus-4-8' .pipeline/feat/MODEL_LOG.md 2>/dev/null; then
+if grep -q '요청 claude-opus-5 → 실제 claude-opus-4-8' .pipeline/feat/MODEL_LOG.md 2>/dev/null; then
   green "  PASS  다른 모델이 돌면 MODEL_LOG 에 기록된다"; PASS=$((PASS+1))
 else
   red   "  FAIL  모델 교체가 기록되지 않음"
@@ -482,10 +482,10 @@ echo "=== 레이트 리밋 순환 ==="
 # --fallback-model 은 창 소진 거부를 안 받는다 (2026-08-26 실측). 셸이 감지해 갈아탄다.
 setup
 got=0
-env FAKE_SCENARIO=ok AUTO=1 TEST_CMD="true" FAKE_RATELIMIT_MODELS="claude-fable-5-1" \
+env FAKE_SCENARIO=ok AUTO=1 TEST_CMD="true" FAKE_RATELIMIT_MODELS="claude-opus-5" \
   ./orchestrate.sh feat >/dev/null 2>&1 || got=$?
 if [ "$got" -eq 0 ] && [ -f .pipeline/feat/design.ratelimit1.stream.jsonl ] \
-   && grep -q 'model=claude-opus-5' .pipeline/feat/DESIGN.args 2>/dev/null \
+   && grep -q 'model=claude-fable-5-1' .pipeline/feat/DESIGN.args 2>/dev/null \
    && grep -q '레이트 리밋 거부' .pipeline/feat/FAIL_LOG.md 2>/dev/null; then
   green "  PASS  리밋 거부면 다음 모델로 갈아타고 증거를 남긴다"; PASS=$((PASS+1))
 else
@@ -543,19 +543,16 @@ echo
 echo "=== 단계별 상한·CLI 전달 ==="
 # 모델과 턴/예산이 단계마다 다르게 전달되는지. 여기가 어긋나면
 # "구현만 중간 티어" 같은 티어링 결정이 조용히 무효가 된다. 예산 기본값은 없음이다.
-# 정본과 다른 한 줄: impl 이 sonnet-5 가 아니라 opus-5 다. 이 저장소의 확정 결정이고
-# (HANDOFF 10절 · design-notes §9) 티어링 근거가 바뀐 것이 아니다. 다음 동기화 때
-# 정본 test/run-tests.sh 를 덮어쓰면 이 줄이 되돌아가므로 다시 넣어라.
 setup
 env FAKE_SCENARIO=ok AUTO=1 TEST_CMD="true" ./orchestrate.sh feat >/dev/null 2>&1
 d="$(head -1 .pipeline/feat/DESIGN.args 2>/dev/null)"
 j="$(head -1 .pipeline/feat/JUDGE.args  2>/dev/null)"
 i="$(head -1 .pipeline/feat/IMPL.args   2>/dev/null)"
 v="$(head -1 .pipeline/feat/VERIFY.args 2>/dev/null)"
-if [ "$d" = "model=claude-fable-5-1 turns=60 budget=없음" ] \
+if [ "$d" = "model=claude-opus-5 turns=60 budget=없음" ] \
    && [ "$j" = "model=claude-fable-5-1 turns=80 budget=없음" ] \
-   && [ "$i" = "model=claude-opus-5 turns=80 budget=없음" ] \
-   && [ "$v" = "model=claude-fable-5-1 turns=80 budget=없음" ]; then
+   && [ "$i" = "model=claude-sonnet-5 turns=80 budget=없음" ] \
+   && [ "$v" = "model=claude-opus-5 turns=80 budget=없음" ]; then
   green "  PASS  단계별 모델·턴이 각각 전달되고 예산 상한은 기본 없음이다"; PASS=$((PASS+1))
 else
   red   "  FAIL  상한 전달 어긋남"
@@ -749,7 +746,7 @@ if have_detach; then
   setup
   detach env FAKE_SCENARIO_DESIGN=crash_swapped AUTO=1 TEST_CMD=true \
     ./orchestrate.sh feat >/dev/null 2>&1 || true
-  if grep -q '요청 claude-fable-5-1 → 실제 claude-opus-4-8' .pipeline/feat/MODEL_LOG.md 2>/dev/null; then
+  if grep -q '요청 claude-opus-5 → 실제 claude-opus-4-8' .pipeline/feat/MODEL_LOG.md 2>/dev/null; then
     green "  PASS  크래시 경로에서도 모델 교체가 MODEL_LOG 에 남는다"; PASS=$((PASS+1))
   else
     red   "  FAIL  크래시 시 모델 교체 미기록"; sed 's/^/         /' .pipeline/feat/MODEL_LOG.md 2>/dev/null; FAIL=$((FAIL+1))
@@ -791,6 +788,70 @@ else
   red   "  FAIL  이전 스트림이 덮어써짐"
   ls -1 .pipeline/feat/ 2>/dev/null | sed 's/^/         /'
   FAIL=$((FAIL+1))
+fi
+teardown
+
+echo
+echo "=== 단계별 쓰기 권한 게이트 ==="
+# ALLOWED_FILES 하나로는 "누가 어느 파일을 고쳐도 되는가"를 못 가른다. 검증이 소스를
+# 땜질해 테스트를 통과시키는 경로와 구현이 테스트를 깎는 경로는 둘 다 목록 안에서
+# 일어나므로 범위 게이트를 그대로 통과한다 (2026-09-04 분석: verify 스트림 13개에서
+# 사건 0건이었으나 게이트가 잡은 0이 아니라 아직 안 일어난 0이었다).
+# 확인할 것은 네 방향이다 — 두 이탈을 잡는가, 두 정상 경로를 통과시키는가.
+expect "검증이 ALLOWED_FILES 안의 소스를 고치면 죽는다" 2 -- \
+  FAKE_SCENARIO_VERIFY=verify_edits_source FAKE_ALLOWED="x.txt t.test.txt" FAKE_TEST_FILES="t.test.txt"
+expect "검증이 TEST_FILES 의 테스트 파일을 쓰면 완주한다 (대조군)" 0 -- \
+  FAKE_SCENARIO_VERIFY=verify_edits_test FAKE_ALLOWED="x.txt t.test.txt" FAKE_TEST_FILES="t.test.txt"
+expect "구현이 TEST_FILES 의 테스트 파일을 고치면 죽는다" 2 -- \
+  FAKE_SCENARIO_IMPL=impl_edits_test FAKE_ALLOWED="x.txt t.test.txt" FAKE_TEST_FILES="t.test.txt"
+expect "구현이 소스를 고치면 완주한다 (대조군)" 0 -- \
+  FAKE_SCENARIO_IMPL=impl_edits_source FAKE_ALLOWED="x.txt t.test.txt" FAKE_TEST_FILES="t.test.txt"
+
+# 낡은 테스트 인계: 이미 커밋된 테스트 파일을 검증이 고치는 것은 정상 경로다.
+# 새 파일 생성만 통과시키고 기존 파일 수정을 막으면 impl↔verify 인계가 교착된다.
+setup
+echo "old" > t.test.txt; git add -A; git commit -qm "old test"
+got=0
+env FAKE_SCENARIO_VERIFY=verify_edits_test FAKE_ALLOWED="x.txt t.test.txt" FAKE_TEST_FILES="t.test.txt" \
+  AUTO=1 TEST_CMD="true" ./orchestrate.sh feat >/dev/null 2>&1 || got=$?
+if [ "$got" -eq 0 ]; then
+  green "  PASS  검증이 기존 테스트 파일을 고쳐도 완주한다 (낡은 테스트 인계)"; PASS=$((PASS+1))
+else
+  red   "  FAIL  기존 테스트 수정이 막힘 — exit=$got (기대 0)"
+  grep -m1 'note:' .pipeline/feat/STATE.md 2>/dev/null | sed 's/^/         /'
+  FAIL=$((FAIL+1))
+fi
+teardown
+
+# 재시도 루프: 2차 impl 은 1차 verify 가 남긴 테스트 파일을 워킹트리에서 본다.
+# 기준선을 impl 직전에 다시 찍지 않으면 1차 verify 의 변경이 2차 impl 의 죄가 된다.
+setup
+got=0
+# 검증 명령은 1차에 실패하고 2차에 통과한다 (.once 마커).
+env FAKE_SCENARIO_VERIFY=verify_edits_test \
+  FAKE_ALLOWED="x.txt t.test.txt" FAKE_TEST_FILES="t.test.txt" \
+  AUTO=1 MAX_RETRY=1 TEST_CMD="test -f .pipeline/feat/.once || { touch .pipeline/feat/.once; false; }" \
+  ./orchestrate.sh feat >/dev/null 2>&1 || got=$?
+if [ "$got" -eq 0 ] && ! grep -q '테스트 파일을 수정함' .pipeline/feat/FAIL_LOG.md 2>/dev/null; then
+  green "  PASS  재시도 2차 impl 은 1차 verify 의 테스트 변경을 뒤집어쓰지 않는다"; PASS=$((PASS+1))
+else
+  red   "  FAIL  재시도에서 기준선이 낡음 — exit=$got (기대 0)"
+  grep -m1 'note:' .pipeline/feat/STATE.md 2>/dev/null | sed 's/^/         /'
+  FAIL=$((FAIL+1))
+fi
+teardown
+
+# 계약 형식: 블록이 없거나 ALLOWED_FILES 밖의 파일을 담으면 설계 직후($0 추가 비용)에 죽는다.
+expect "설계에 TEST_FILES 블록이 없으면 죽는다"            2 -- FAKE_SCENARIO=ok FAKE_NO_TEST_FILES=1
+expect "TEST_FILES 가 ALLOWED_FILES 밖의 파일을 담으면 죽는다" 2 -- \
+  FAKE_SCENARIO=ok FAKE_ALLOWED="x.txt" FAKE_TEST_FILES="other.test.txt"
+setup
+got=0
+env FAKE_SCENARIO=ok FAKE_NO_TEST_FILES=1 AUTO=1 TEST_CMD="true" ./orchestrate.sh feat >/dev/null 2>&1 || got=$?
+if [ "$got" -eq 2 ] && [ ! -f .pipeline/feat/JUDGE.md ]; then
+  green "  PASS  계약 위반은 판단검증을 띄우기 전에 잡힌다 (비용 \$0)"; PASS=$((PASS+1))
+else
+  red   "  FAIL  계약 위반인데 judge 가 돌았거나 exit 이 다름 — exit=$got"; FAIL=$((FAIL+1))
 fi
 teardown
 

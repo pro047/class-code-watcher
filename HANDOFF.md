@@ -1258,7 +1258,17 @@ macOS·리눅스에서는 `python3 -m venv .venv && .venv/bin/python -m pip inst
 - 이 환경에서 `Observer` 는 `WindowsApiObserver`(ReadDirectoryChangesW)로 해석된다
 - 비밀값 2개: `OPENAI_API_KEY`, `DISCORD_WEBHOOK_URL`. 실행 PC 의 프로젝트 루트(또는 exe 옆)
   `.env` 에 둔다. USB 운영 전제는 C-21 로 삭제했다
-- 모델 배치: design·judge·verify = `claude-fable-5-1`, impl = `claude-opus-5`
+- 모델 배치 (**2026-09-05 갱신** — 스킬 정본의 재가격을 받았다):
+  design·verify = `claude-opus-5`, judge = `claude-fable-5-1`, impl = `claude-sonnet-5`.
+  근거는 45 단계주행을 현재 단가로 재가격한 실측 — 완주 1회 **$13.1 → $9.9**
+  (design $4.38→$2.59, verify $3.65→$2.22). judge 만 Fable 로 남긴 것은 **설계와 다른
+  모델이 감사하게** 하려는 것이다. **근거가 약한 곳**: Opus verify 는 과거 0건이라
+  품질 미측정이고, Sonnet impl 은 1건뿐이다 — Sonnet 이 주행당 재시도를 0.6회 이상
+  더 만들면 손해다(재시도 1회 ≈ impl+verify $3.6). **3주행 뒤 재판단한다.**
+  폴백은 Opus 단계에서 Fable 로 **올린** 뒤 sonnet 을 최후 수단으로 둔다 —
+  FAIL_LOG 집계에서 Fable 리밋 5건·Opus 리밋 5건으로 양쪽 풀이 다 막히기 때문이다.
+  **2026-09-04 실측: 세션 한도(계정 단위)는 폴백 체인이 못 구한다** — 세 모델이
+  전부 같은 `You've hit your session limit` 을 받고 judge 가 $0 에 죽었다.
 - **7단계는 Windows PC 에서만 끝난다.** PyInstaller 는 크로스 빌드를 하지 않고
   DoD 4번(`PRD.md:747`)이 "Python 미설치 **Windows** PC 에서 exe 단독 실행"을 요구한다.
   위의 "게이트 3종은 OS 를 안 탄다"는 **게이트 얘기지 7단계 얘기가 아니다** — macOS 에서

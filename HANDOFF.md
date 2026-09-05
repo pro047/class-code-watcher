@@ -1268,7 +1268,10 @@ macOS·리눅스에서는 `python3 -m venv .venv && .venv/bin/python -m pip inst
   폴백은 Opus 단계에서 Fable 로 **올린** 뒤 sonnet 을 최후 수단으로 둔다 —
   FAIL_LOG 집계에서 Fable 리밋 5건·Opus 리밋 5건으로 양쪽 풀이 다 막히기 때문이다.
   **2026-09-04 실측: 세션 한도(계정 단위)는 폴백 체인이 못 구한다** — 세 모델이
-  전부 같은 `You've hit your session limit` 을 받고 judge 가 $0 에 죽었다.
+  전부 같은 `You've hit your session limit` 을 받았다. **폴백은 공짜가 아니다**:
+  1순위 `claude-fable-5-1` 이 **42턴 · $2.95** 를 쓴 뒤 한도에 걸렸고, 그 뒤
+  opus-5·sonnet-5 가 각 1턴 $0 로 거부됐다 (`judge.ratelimit1/2.result.json`).
+  즉 한도 사망의 손실은 그때까지 쓴 값이지 0 이 아니다.
 - **7단계는 Windows PC 에서만 끝난다.** PyInstaller 는 크로스 빌드를 하지 않고
   DoD 4번(`PRD.md:747`)이 "Python 미설치 **Windows** PC 에서 exe 단독 실행"을 요구한다.
   위의 "게이트 3종은 OS 를 안 탄다"는 **게이트 얘기지 7단계 얘기가 아니다** — macOS 에서

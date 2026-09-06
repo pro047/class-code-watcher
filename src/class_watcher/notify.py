@@ -172,6 +172,10 @@ SKIP_NO_DISCORD = "no_discord_option"
 SKIP_DRY_RUN = "dry_run"
 SKIP_SECRETS_BLOCKED = "secrets_blocked"
 SKIP_NO_SUMMARY = "no_summary"
+# 해시로는 바뀌었으나 diff 대상 파일이 0개다 (C-26). SKIP_NO_CHANGE 와 가르는 이유:
+# 그것을 재사용하면 session.json 이 `no_change: false` 인데 `skip_reason: "no_change"` 가
+# 되어 같은 문서 안에서 서로를 부정한다 (2026-09-06 사람 판정 — PRD C-26 의 D11 정정).
+SKIP_NO_MEANINGFUL_CHANGE = "no_meaningful_change"
 
 # DeliveryOutcome.error → session.json 의 error 값.
 ERROR_DISCORD_TIMEOUT = "discord_timeout"

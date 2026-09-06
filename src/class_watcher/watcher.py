@@ -46,6 +46,7 @@ from .notify import (
     SKIP_DRY_RUN,
     SKIP_NO_CHANGE,
     SKIP_NO_DISCORD,
+    SKIP_NO_MEANINGFUL_CHANGE,
     SKIP_NO_SUMMARY,
     SKIP_SECRETS_BLOCKED,
     DeliveryOutcome,
@@ -619,17 +620,21 @@ def _run_notify(
     *,
     change_stats: Mapping[str, object],
     ended_at: str,
-    nothing_to_send: bool,
+    nothing_to_send: str | None,
     secrets_blocked: bool,
 ) -> DeliveryOutcome:
     """Discord 전송 지점 (FR-033/034/050~052). 판정은 전부 notify.py 순수 함수가 한다.
 
     렌더러에는 summary.json 의 doc 만 넘어간다 — final.diff·정제본을 다시 읽는 경로를
-    만들지 않는다 (FR-051). 전송이 아예 일어나지 않는 5갈래는 여기서 갈리고, 그중 넷은
+    만들지 않는다 (FR-051). 전송이 아예 일어나지 않는 6갈래는 여기서 갈리고, 그중 넷은
     콘솔 출력도 기존 문구를 그대로 쓴다.
+
+    nothing_to_send 는 불리언이 아니라 **사유 문자열**이다 (C-26). 해시 기준 변경 없음과
+    diff 기준 변경 0개는 둘 다 전송 0회지만 session.json 에 다른 값이 남아야 한다 —
+    하나로 묶으면 `no_change: false` 인데 `skip_reason: "no_change"` 가 된다.
     """
-    if nothing_to_send:
-        return skipped_delivery(SKIP_NO_CHANGE)
+    if nothing_to_send is not None:
+        return skipped_delivery(nothing_to_send)
     if secrets_blocked:
         return skipped_delivery(SKIP_SECRETS_BLOCKED)
     if state.config.dry_run:
@@ -833,7 +838,13 @@ def _finalize(
             summarize,
             change_stats=_change_stats_of(diff_result, statuses, state.event_count),
             ended_at=ended_at,
-            nothing_to_send=hash_no_change or no_meaningful_change,
+            nothing_to_send=(
+                SKIP_NO_CHANGE
+                if hash_no_change
+                else SKIP_NO_MEANINGFUL_CHANGE
+                if no_meaningful_change
+                else None
+            ),
             secrets_blocked=redaction is not None and redaction.blocked,
         )
     except KeyboardInterrupt:

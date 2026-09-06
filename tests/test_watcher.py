@@ -1295,6 +1295,9 @@ def test_no_change_session_sends_nothing(
 ) -> None:
     # 케이스 26 · 불변식 (FR-035): 변경 없음이면 OpenAI·Discord 모두 0회. 두 계수가
     # 전부 session.json 에 남아 사후에 증명된다.
+    # 이 테스트는 test_whitespace_only_session_completes_without_calling_anything 과
+    # 짝이다 — 여기는 해시 기준(SKIP_NO_CHANGE), 저기는 diff 기준
+    # (SKIP_NO_MEANINGFUL_CHANGE). 둘을 한 사유로 합치면 양쪽 중 하나가 깨진다 (C-26).
     config, paths, selection = _setup_session(tmp_path)
     _script_loop(monkeypatch, [])
     _forbid_caller(monkeypatch)
@@ -2204,12 +2207,14 @@ def test_whitespace_only_session_completes_without_calling_anything(
         "deleted_lines": 0,
     }
     assert doc["openai"] == {"calls": 0, "retries": 0, "model": None, "request_id": None}
+    # skip_reason 이 no_change 가 아닌 이유: 위에서 no_change 를 False 로 단언했다.
+    # 둘을 같은 값으로 두면 같은 문서가 서로를 부정한다 (C-26, 2026-09-06 사람 판정).
     assert doc["discord"] == {
         "delivered": False,
         "http_status": None,
         "requests": 0,
         "chunks": 0,
-        "skip_reason": notify.SKIP_NO_CHANGE,
+        "skip_reason": notify.SKIP_NO_MEANINGFUL_CHANGE,
     }
     # 로컬 산출물은 남는다 (PRD 12절). 외부로 나갈 것만 안 만든다.
     assert paths.final_diff.read_text(encoding="utf-8") == "# skipped: a.py (whitespace_only)\n"

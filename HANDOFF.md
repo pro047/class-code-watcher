@@ -1,5 +1,7 @@
 # 핸드오프 — Class Code Watcher
 
+- **실기기 세션은 `docs/FIELD-CHECKLIST.md` 한 장을 따라간다** — 열 항목의 실행 순서와
+  볼 것이 거기 모여 있다. 이 문서는 근거·배경이고 그 문서는 손이다.
 - 기준 문서: `PRD.md` **v1.9** (14절 MVP 단계별 개발 계획, C-17~C-26 반영)
 - 갱신 시점: 2026-09-06 (`noise-filter` 완주 — F6·F7 이 닫혔다)
 - 기준 커밋: **이 문서가 마지막으로 커밋된 시점의 main** — `git log -1 --oneline -- HANDOFF.md`
@@ -832,9 +834,23 @@ PC 에서만) · 5단계 **B**(분할 — 자연 트리거 불가, 상수를 임
 |---|---|---|
 | **N1** | Windows 실기기에서 감시 중 대상 파일을 **열어 읽기만** 한다 (저장 금지) | 콘솔에 `변경 감지` 0줄, `events.jsonl` 미생성, `change_stats.events == 0`. **C-25 원본(atime 17건)은 NTFS 전용이라 macOS 에서 재현 불가** |
 | **N2** | VS Code + prettier + `formatOnSave` 로 포맷만 저장 | `no_change: false` · `status: completed` · `openai.calls: 0` · `reason: whitespace_only`, 종료 코드 0. **89,101자가 0 이 되지는 않는다** — 줄 접힘은 여전히 `modified` |
-| **N3** | N2 의 `session.json` 을 사람이 읽는다 | `no_change: false` 인데 `discord.skip_reason: "no_change"` 인 조합을 **모순으로 읽는가.** 읽는다면 C-26 의 D11 이 틀린 것이고, 그때가 `notify.py` 에 6번째 사유 상수를 넣을 시점이다 |
+| ~~**N3**~~ | ~~N2 의 `session.json` 을 사람이 읽는다~~ | **✅ 판정 완료 (2026-09-06): 모순으로 읽힌다.** `no_change: false` 인데 `discord.skip_reason: "no_change"` 는 앞뒤가 안 맞는다 → **C-26 의 D11 이 틀렸다.** 후속: `notify.py` 에 6번째 사유 상수 `no_meaningful_change` 를 넣는다 (아래) |
 
-**N3 이 C-26 의 유일한 미검증 표면이다.** (VERIFY.md 는 이 셋을 H1·H2·H6 으로 부른다 — 그 문서 안에서의 번호이고, 여기서는 (차) 의 H1·H3·H4 와 겹치지 않게 N 으로 쓴다.)
+**N3 은 닫혔고 결과는 「D11 이 틀렸다」다.** 남은 실기기 확인은 **N1·N2** 둘이다.
+(VERIFY.md 는 이 셋을 H1·H2·H6 으로 부른다 — 그 문서 안에서의 번호이고, 여기서는
+(차) 의 H1·H3·H4 와 겹치지 않게 N 으로 쓴다.)
+
+**후속 작업 — ✅ 끝났다 (2026-09-06).** `notify.py` 에 6번째 사유
+`SKIP_NO_MEANINGFUL_CHANGE = "no_meaningful_change"` 를 넣고 `_run_notify` 의
+`nothing_to_send` 를 불리언에서 **사유 문자열**로 바꿨다. 두 세션 테스트가 짝으로 지킨다 —
+`test_no_change_session_sends_nothing`(해시 기준) ↔
+`test_whitespace_only_session_completes_without_calling_anything`(diff 기준).
+`test_skip_reasons_are_distinct_strings` 가 값이 겹치면 잡는다. PRD 12절 행·C-26 근거도
+함께 고쳤다. 게이트 **490 → 492 passed**.
+
+**파이프라인 밖에서 고쳤다** — 상수 1개 + 분기 1개 + 테스트 2개인데 파이프라인 한 바퀴는
+이번 주행 실적으로 ~$20 이다. 6절의 「1단계부터는 파이프라인 안에서 닫는다」와 어긋나는
+예외이고, **사람이 결정했다** (2026-09-06).
 
 **운영 회피책** — 2026-09-06 `noise-filter` 로 **두 항목의 성격이 바뀌었다.** 지우지 않고
 상태를 적는다 (실기기 N1·N2 로 확인한 뒤에 정리한다).

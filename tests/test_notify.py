@@ -928,10 +928,11 @@ def test_partial_delivery_records_what_actually_went_out() -> None:
         notify.SKIP_DRY_RUN,
         notify.SKIP_SECRETS_BLOCKED,
         notify.SKIP_NO_SUMMARY,
+        notify.SKIP_NO_MEANINGFUL_CHANGE,
     ],
 )
 def test_skipped_delivery_keeps_a_zero_request_counter(reason: str) -> None:
-    # FR-035/FR-052: 생략 5갈래는 전부 requests 0 이고 사유가 그대로 남는다.
+    # FR-035/FR-052: 생략 6갈래는 전부 requests 0 이고 사유가 그대로 남는다.
     outcome = notify.skipped_delivery(reason)
 
     assert outcome.requests == 0
@@ -1136,3 +1137,20 @@ def test_render_stats_only_shows_numbers_and_reason(tmp_path: Path) -> None:
     assert str(tmp_path) in block
     assert notify.find_diff_lines(block) == ()
     block.encode("cp949")
+
+
+def test_skip_reasons_are_distinct_strings() -> None:
+    # C-26: no_meaningful_change 를 no_change 로 되돌리면 session.json 이
+    # `no_change: false` 인데 `skip_reason: "no_change"` 가 되어 서로를 부정한다
+    # (2026-09-06 사람 판정). 값이 겹치는 순간 여기서 걸린다.
+    reasons = [
+        notify.SKIP_NO_CHANGE,
+        notify.SKIP_NO_DISCORD,
+        notify.SKIP_DRY_RUN,
+        notify.SKIP_SECRETS_BLOCKED,
+        notify.SKIP_NO_SUMMARY,
+        notify.SKIP_NO_MEANINGFUL_CHANGE,
+    ]
+
+    assert len(set(reasons)) == len(reasons)
+    assert notify.SKIP_NO_MEANINGFUL_CHANGE != notify.SKIP_NO_CHANGE

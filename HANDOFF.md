@@ -2,12 +2,14 @@
 
 - **실기기 세션은 `docs/FIELD-CHECKLIST.md` 한 장을 따라간다** — 열 항목의 실행 순서와
   볼 것이 거기 모여 있다. 이 문서는 근거·배경이고 그 문서는 손이다.
+- **파이프라인 주행 방법은 `CLAUDE.md` 가 정본이다** (2026-09-06 신설) — 런처 프로토콜
+  (게이트 승인은 y 중계, 판단 금지)과 실행 명령. 세션이 자동으로 읽는다.
 - 기준 문서: `PRD.md` **v1.9** (14절 MVP 단계별 개발 계획, C-17~C-26 반영)
 - 갱신 시점: 2026-09-06 (`noise-filter` 완주 — F6·F7 이 닫혔다)
 - 기준 커밋: **이 문서가 마지막으로 커밋된 시점의 main** — `git log -1 --oneline -- HANDOFF.md`
   로 확인한다. 해시를 본문에 박으면 커밋하는 순간 한 커밋 뒤처진다(2026-08-30 에 두 번 겪었다)
-- 게이트 3종 녹색: **490 passed** / ruff clean / mypy 17 files
-  (2026-09-06 macOS 실측, 머지 결과 트리 — `noise-filter` verify 가 452 → 490 으로 올렸다.
+- 게이트 3종 녹색: **492 passed** / ruff clean / mypy 17 files
+  (2026-09-06 macOS 실측 — `noise-filter` verify 가 452 → 490, D11 정정이 490 → 492.
   452 는 2026-09-03 Windows·Python 3.14.6 값이었다 — 게이트는 OS 를 안 탄다).
   **하네스 게이트는 별도다: `./test/run-tests.sh` 73 통과 / 0 실패.**
 - 한 줄 요약: **0~5단계 완료. C-17~C-26 이 전부 코드에 들어갔다**
@@ -29,7 +31,7 @@
   실전송), 그리고 사람 확인 **C(모바일)·D(수신자 5인)**. **D 가 이 제품의 최종 합격선이다**
   (PRD 15절). **C-22 의 90초도 여기서 처음 제품 경로를 탄다** — 09-02 가 15초로 터진 자리다,
   (2) ~~F6·F7 주행~~ — **✅ 닫혔다** (2026-09-06 `noise-filter`, `bcd440e`). PRD v1.8 C-24·C-25
-  + v1.9 C-26. 게이트 490 passed. 남은 것은 실기기 확인뿐이고 (1) 과 같은 자리에서 본다,
+  + v1.9 C-26. 게이트 492 passed. 남은 것은 실기기 확인뿐이고 (1) 과 같은 자리에서 본다,
   (3) 6단계 통합,
   (4) **7단계 재검토** — Smart App Control 이 서명 없는 exe 를 차단한다. 9절 오픈 이슈 2번이
   「백신 오탐(확률적)」에서 「OS 정책(확정적)」으로 바뀌었다. 8절 지뢰 참조.
@@ -97,15 +99,22 @@ design → judge → impl → verify → run_verify(셸 판정)
 | `approve.sh` | 사람이 게이트 버튼을 누르는 자리 |
 | 사람 | 유일하게 게이트를 통과시키는 주체 |
 
-실행:
+**실행 방법의 정본은 `CLAUDE.md` 다** (2026-09-06 신설). 런처 프로토콜과 명령이 거기 있다.
 
 ```bash
-PY=.venv/Scripts/python ./orchestrate.sh <feature-name>
+./pipeline-worktree.sh <feature>     # 메인 체크아웃에서는 시작이 거부된다
+cd ../class-code-watcher-pipeline-<feature>
+export PY=.venv/bin/python           # 먼저 export 한다 — 같은 줄에 두면 빈 문자열이 된다
+PREFLIGHT_CMD="$PY -m mypy src && $PY -m ruff check ." ./orchestrate.sh <feature>
 # AUTO=1          사람 게이트 건너뜀 (무인)
 # MAX_RETRY=3     재시도 횟수
 # FRESH_DESIGN=1  DONE 상태인 DESIGN.md 를 무시하고 설계를 새로 뽑음
-# GATE_TOOLS_OVERRIDE="Bash(...)"  게이트 명령 허용 목록 교체
+# RESUME_FROM=verify  impl 을 건너뛰고 verify 부터 (IMPL.md 가 DONE 일 때만)
 ```
+
+**`PREFLIGHT_CMD` 를 안 넘기면 mypy·ruff 없이 verify 가 녹색을 준다** — 게이트 3종 중 둘이
+빠진다. 기본값이 비어 있는 이유는 그 명령을 박으면 mypy 없는 환경(테스트 샌드박스)에서
+게이트 검증 자체가 죽기 때문이다.
 
 주행 산출물은 `.pipeline/<feature>/` 아래에 남는다. **커밋되지 않는다** — 자세한 것은 2.1 절.
 
@@ -113,6 +122,18 @@ PY=.venv/Scripts/python ./orchestrate.sh <feature-name>
 pytest는 수집 테스트가 0개면 exit 5로 실패한다 — 검증 단계가 테스트를 안 쓰고 넘어가는 걸 막으려는 의도적 설계다.
 
 **게이트 판정권은 셸에 있다.** 에이전트가 "통과했다"고 쓴 문장은 읽지 않고 `run_verify` 가 직접 돌려 판정한다.
+
+**단계별 쓰기 권한 게이트** (2026-09-05 정본에서 받음). 범위 게이트는 「어느 파일이 바뀌어도
+되는가」만 보고 「누가」는 안 봤다 — verify 의 「테스트만 수정」과 impl 의 「테스트를 고치지
+않는다」가 둘 다 `ALLOWED_FILES` 안에서 일어나 그대로 지났다. 이제 `DESIGN.md` 에
+**`TEST_FILES` 블록**을 요구하고(설계 직후 형식 게이트, judge 전이라 $0), impl·verify
+직전에 지문을 찍어 단계 직후 대조한다. **impl 은 테스트를, verify 는 소스를 건드리면 죽는다.**
+`noise-filter` 주행에서 양방향으로 실제 작동했다.
+
+**설계 단계가 이전 시도를 물려받는다** (2026-09-06, `7c06e77`). `prompts/design.md` 의 입력에
+`DECISION.md`(사람 결정)·`IMPL.md`(이전 BLOCKED)·`JUDGE.md`(이전 감사)가 들어갔다. 셋 다
+「있으면」 조건이라 첫 주행에는 영향이 없다. **`.pipeline/<feature>/DECISION.md` 에 사람 결정을
+써 두면 재설계가 그것을 전제로 시작한다** — `noise-filter` 가 BLOCKED 를 그렇게 풀었다.
 
 ### 2.1 `.pipeline/` — 주행 산출물과 증거
 
@@ -223,8 +244,15 @@ jq -Rr 'fromjson? // empty | select(.type?=="assistant") | .message.content[]?
 | `7ab5376` | C-19 2차 주행 — design·judge DONE. 산출물 사본을 `docs/pipeline-transfer/` 에 커밋 (뒤에 폐기됨) |
 | `1e46214`·`01a7874` | 09-02 하루 8시간 세션이 드러낸 F14·F15 → **PRD v1.7 (C-22 타임아웃 90초 · C-23 계열 묶기)** |
 | `3df4f36` | **C-19 3차 주행 완주 — 동적 묶음 제목·계열 묶기·타임아웃 90초. 테스트 422 → 452. 재시도 0회** (5절 아) |
+| `4f478e0` | HANDOFF 2,639 → 1,242줄. 완료 기록을 `docs/JOURNAL.md` 로 가르고 5절 **(차) 미해결 항목** 신설 |
+| `0e69284` | `experiments/summary_v2/` — 복습 노트용 프롬프트 v2 실험 (F16 의 재료) |
+| `b9294db`·`15fc2dc`·`d58f45f` | **하네스를 스킬 정본으로 3차 동기화** — 범위 게이트(`ALLOWED_FILES`)·런처 중계 승인(`--relayed`)·단계별 쓰기 게이트(`TEST_FILES`)·재가격된 모델 티어링 |
+| `38855da`·`70e1399` | **PRD v1.8 (C-24 공백 전용 · C-25 내용 미변경) · v1.9 (C-26 두 축 분리)** + `CLAUDE.md` 신설 |
+| `7c06e77` | 설계 단계가 `DECISION.md`·`IMPL.md`·`JUDGE.md` 를 물려받는다 |
+| `965e7f7`·`bcd440e` | **`noise-filter` 주행 완주 — FR-025·FR-018. 테스트 452 → 490** (JOURNAL 카) |
+| `8951e84` | **D11 정정** — 전송 생략 사유 `no_meaningful_change` 신설. 490 → 492. `docs/FIELD-CHECKLIST.md` 신설 |
 
-### 0~5단계 산출물 — 소스 17모듈 / 테스트 452개
+### 0~5단계 산출물 — 소스 17모듈 / 테스트 492개
 
 | 소스 | 단계 | 역할 |
 |---|---|---|
@@ -1248,7 +1276,9 @@ git clone https://github.com/pro047/class-code-watcher.git
 cd class-code-watcher
 py -3.14 -m venv .venv                    # 3.11 이상이면 됨
 .venv\Scripts\python -m pip install -e ".[dev]"
-.venv\Scripts\python -m pytest -q       # 452 passed 나와야 정상 (2026-09-03 기준)
+.venv\Scripts\python -m pytest -q       # 492 passed 나와야 정상 (2026-09-06 기준)
+.venv\Scripts\python -m ruff check .    # All checks passed!
+.venv\Scripts\python -m mypy src        # no issues found in 17 source files
 ```
 
 **실행은 `class-watcher.exe` 가 아니라 모듈로 한다** — pip 런처 스텁은 서명이 없어

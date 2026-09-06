@@ -22,6 +22,7 @@ DEFAULT_MAX_DIFF_BYTES = 1 << 20  # FR-024 "기본 1MB"
 SKIP_BINARY = "binary"
 SKIP_TOO_LARGE = "too_large"
 SKIP_DECODE_ERROR = "decode_error"
+SKIP_WHITESPACE_ONLY = "whitespace_only"
 
 # watcher 의 STATUS_* 와 같은 값. watcher 가 이 모듈을 부르므로 거꾸로 import 하면 순환이다.
 STATUS_ADDED = "added"
@@ -112,21 +113,50 @@ def unified_diff_text(rel_path: str, before: str, after: str) -> str:
     return f"{text}\n" if text else ""
 
 
-def _count_lines(diff_text: str) -> tuple[int, int]:
-    """본문의 ± 라인을 센다. 헤더는 앞 두 줄이므로 위치로 건너뛴다.
+def strip_all_whitespace(line: str) -> str:
+    """FR-025 ① 의 "공백을 모두 제거". 앞뒤뿐 아니라 줄 가운데도 제거한다.
 
-    startswith(("+++", "---")) 로 거르면 `++i;`·`--count;` 처럼 ++/-- 로 시작하는 본문
-    라인이 헤더로 오인돼 집계에서 빠진다 — 자바·JS 에 실제로 나오는 문장이다.
-    per-file diff 는 항상 `--- a/…`·`+++ b/…` 두 줄로 시작하니 위치가 더 정확하다.
+    인자 없는 str.split() 의 유니코드 공백 정의를 그대로 빌린다. 별도의 공백 문자
+    목록을 손으로 적지 않는다.
     """
+    return "".join(line.split())
+
+
+def normalized_lines(text: str) -> list[str]:
+    """공백 제거 후 빈 줄을 버린 라인 시퀀스. FR-025 판정의 유일한 입력 형태.
+
+    splitlines() 는 unified_diff_text(:104-110) 와 같은 개행 정규화를 재사용한다.
+    """
+    stripped = (strip_all_whitespace(line) for line in text.splitlines())
+    return [line for line in stripped if line]
+
+
+def meaningful_line_counts(before: str, after: str) -> tuple[int, int]:
+    """(added, deleted) — 공백 전용 줄을 뺀 ± 라인 수 (FR-025 ①④).
+
+    normalized_lines 로 접은 두 시퀀스에 difflib.unified_diff(lineterm="", n=0) 를
+    한 번 더 돌리고 앞 두 줄(헤더)을 위치로 건너뛴 뒤 ± 를 센다. 위치 기준인 이유는
+    `++i;`·`--count;` 처럼 ++/-- 로 시작하는 본문 라인이 헤더로 오인되면 안 되기
+    때문이다. 차이가 없으면 difflib 이 아무 줄도 내지 않으므로 (0, 0) 이다.
+    """
+    diff = list(
+        difflib.unified_diff(normalized_lines(before), normalized_lines(after), lineterm="", n=0)
+    )
+    if not diff:
+        return 0, 0
     added = 0
     deleted = 0
-    for line in diff_text.splitlines()[2:]:
+    for line in diff[2:]:
         if line.startswith("+"):
             added += 1
         elif line.startswith("-"):
             deleted += 1
     return added, deleted
+
+
+def is_whitespace_only_change(before: str, after: str) -> bool:
+    """FR-025 ② — meaningful_line_counts 가 (0, 0) 이면 True."""
+    return meaningful_line_counts(before, after) == (0, 0)
 
 
 def _skipped(rel_path: str, reason: str) -> FileDiff:
@@ -171,8 +201,12 @@ def diff_file(
     if decoded_before is None or decoded_after is None:
         return _skipped(rel_path, SKIP_DECODE_ERROR)
 
-    diff_text = unified_diff_text(rel_path, decoded_before[0], decoded_after[0])
-    added, deleted = _count_lines(diff_text)
+    before_text, after_text = decoded_before[0], decoded_after[0]
+    added, deleted = meaningful_line_counts(before_text, after_text)
+    if (added, deleted) == (0, 0):
+        return _skipped(rel_path, SKIP_WHITESPACE_ONLY)
+
+    diff_text = unified_diff_text(rel_path, before_text, after_text)
     # 남아 있는 쪽의 인코딩이 그 파일의 현재 인코딩이다.
     encoding = decoded_after[1] if final is not None else decoded_before[1]
     return FileDiff(

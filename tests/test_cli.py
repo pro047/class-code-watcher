@@ -18,9 +18,12 @@ from class_watcher.config import (
 )
 from class_watcher.debounce import Debouncer, RawEvent
 from class_watcher.notify import DiscordRequestError
+from class_watcher.session import SessionPaths
 from class_watcher.summarize import BuiltPrompt, LlmResponse
 
 NOW = datetime(2026, 8, 26, 18, 30, 0)
+# 키가 없는 상태가 기본이다 — 이 파일의 매핑 테스트는 외부에 붙지 않는다.
+NO_SECRETS = Secrets(openai_api_key=None, discord_webhook_url=None)
 FAKE_OPENAI_KEY = "sk-test-abcdef1234567890"
 # 실제 Discord 도메인이 아니다. 이 값이 콘솔·산출물로 새는지를 보는 표식이다.
 FAKE_WEBHOOK = "https://discord.example/api/webhooks/1234567890/super-secret-token"
@@ -830,3 +833,74 @@ def test_webhook_url_never_appears_in_any_output_or_artifact(
             raw = path.read_text(encoding="utf-8")
             assert FAKE_WEBHOOK not in raw, f"{name} 에 Webhook URL 이 남았다"
             assert FAKE_OPENAI_KEY not in raw, f"{name} 에 키가 남았다"
+
+
+# ── FR-025(C-24): diff 기준 변경 0개 세션의 종료 코드 (설계 케이스 40~42) ─────
+#
+# run_watch 는 WatchOutcome 만 보고 코드를 정한다. 세션을 실제로 돌리지 않고 outcome 을
+# 직접 넣어 매핑만 고정한다 — 게이트 판정 자체는 test_watcher.py 가 본다.
+
+
+def _prepared_session(root: Path) -> tuple[cli.Preflight, SessionPaths]:
+    tree = _make_tree(root, count=1)
+    args = _parse("watch", str(tree), "--session-dir", str(root / "sessions"))
+    config = cli.build_config(args, NOW)
+    return cli.bootstrap(config, NO_SECRETS, now=NOW, id_suffix="ab12")
+
+
+def _outcome_with(**overrides: object) -> watcher.WatchOutcome:
+    base: dict[str, object] = {
+        "statuses": {"file0.py": "modified"},
+        "unstable": False,
+        "logical_event_count": 1,
+        "no_change": False,
+        "aborted": False,
+        "secrets_blocked": False,
+        "summary_state": watcher.SUMMARY_NOT_RUN,
+        "discord_state": notify.DISCORD_SKIPPED,
+        "no_meaningful_change": False,
+    }
+    base.update(overrides)
+    return watcher.WatchOutcome(**base)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_rc", "snippet"),
+    [
+        # 케이스 40: 요약 단계에 도달하지 않았어도 성공이다. 이 갈래가 없으면
+        # summary_state=not_run 이 아래로 흘러 EXIT_RUNTIME 이 된다.
+        ({"no_meaningful_change": True}, cli.EXIT_OK, "[DONE] 의미 있는 변경이 없어"),
+        # 케이스 41: 비밀값 차단이 앞선다 — 새 갈래가 방어선을 앞지르면 여기서 잡힌다.
+        (
+            {"no_meaningful_change": True, "secrets_blocked": True},
+            cli.EXIT_RUNTIME,
+            "[FAILED] 비밀정보 패턴이 탐지되어",
+        ),
+        # 케이스 42: 평소 세션의 매핑은 그대로다 (게이트 오작동 회귀).
+        ({}, cli.EXIT_RUNTIME, "요약 단계까지 진행하지 못했습니다"),
+    ],
+)
+def test_run_watch_maps_no_meaningful_change_to_exit_code(
+    isolated_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    overrides: dict[str, object],
+    expected_rc: int,
+    snippet: str,
+) -> None:
+    preflight, paths = _prepared_session(isolated_env)
+    outcome = _outcome_with(**overrides)
+
+    def fake_run_session(*args: object, **kwargs: object) -> watcher.WatchOutcome:
+        return outcome
+
+    monkeypatch.setattr(cli, "run_session", fake_run_session)
+
+    rc = cli.run_watch(preflight, paths, NO_SECRETS)
+
+    assert rc == expected_rc
+    captured = capsys.readouterr()
+    assert snippet in captured.out + captured.err
+    # 새 콘솔 문구도 cp949 콘솔에서 안 깨진다 (HANDOFF (다) 재발 방지).
+    captured.out.encode("cp949")
+    captured.err.encode("cp949")

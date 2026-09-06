@@ -16,16 +16,22 @@ from class_watcher.diffgen import (
     SKIP_BINARY,
     SKIP_DECODE_ERROR,
     SKIP_TOO_LARGE,
+    SKIP_WHITESPACE_ONLY,
     STATS_SCHEMA_VERSION,
+    FileDiff,
     build_result,
     change_stats_fields,
     classify_skip,
     decode_snapshot,
     diff_file,
     generate_session_diff,
+    is_whitespace_only_change,
     load_snapshot_bytes,
+    meaningful_line_counts,
+    normalized_lines,
     render_final_diff,
     stats_doc,
+    strip_all_whitespace,
     watched_file_entries,
 )
 from class_watcher.session import SessionPaths, make_session_paths
@@ -34,7 +40,7 @@ BOM = b"\xef\xbb\xbf"
 
 
 def _body_lines(diff_text: str) -> list[str]:
-    """헤더 두 줄과 @@ 를 뺀 본문 라인 — _count_lines 와 같은 셈법으로 기대값을 만든다.
+    """헤더 두 줄과 @@ 를 뺀 본문 라인 — meaningful_line_counts 와 같은 셈법으로 기대값을 만든다.
 
     앞 두 줄을 위치로 떼는 것이 중요하다. startswith 로 걸러내면 ++/-- 로 시작하는
     본문 라인이 같이 사라져 기대값이 구현과 똑같이 틀린다 (아래 회귀 테스트 참조).
@@ -175,14 +181,17 @@ def test_decode_error_skips_only_that_file() -> None:
 
 
 def test_crlf_only_change_yields_empty_diff() -> None:
+    # C-24(FR-025) 이후: 개행만 다른 저장은 본문 차이가 없을 뿐 아니라 "변경으로 세지
+    # 않는" 대상이라 whitespace_only 로 제외된다. 개정 전 기대값은 modified 였다.
     result = diff_file("style.py", b"x\r\ny\r\n", b"x\ny\n")
-    # 해시가 다르므로 상태는 modified 지만, 본문 차이는 없다.
-    assert result.status == "modified"
+    assert result.status == "skipped"
+    assert result.skip_reason == SKIP_WHITESPACE_ONLY
     assert result.diff_text == ""
     assert (result.added_lines, result.deleted_lines) == (0, 0)
     # 파일 말미 개행 없음의 차이도 같은 정규화에 흡수된다.
     trailing = diff_file("t.py", b"x\ny", b"x\ny\n")
     assert trailing.diff_text == ""
+    assert trailing.skip_reason == SKIP_WHITESPACE_ONLY
 
 
 def test_crlf_file_with_real_change_diffs_normally() -> None:
@@ -393,8 +402,10 @@ def test_diffgen_never_shells_out() -> None:
 #
 # 파이프라인 밖에서 발견했다. diff 본문은 처음부터 정확했고 ±라인 **집계만** 틀렸는데,
 # 그 수치가 4단계 LLM 프롬프트와 5단계 디스코드 메시지로 그대로 흘러간다.
-# 게이트가 못 잡은 이유: 위 _body_lines 헬퍼가 _count_lines 와 같은 셈법이라
+# 게이트가 못 잡은 이유: 위 _body_lines 헬퍼가 당시 카운터와 같은 셈법이라
 # 기대값도 같이 틀렸다. 그래서 이 테스트는 헬퍼를 쓰지 않고 숫자를 직접 적는다.
+# C-24 로 카운터가 meaningful_line_counts 로 교체된 뒤에도 같은 수치를 요구한다
+# (설계 케이스 6).
 
 
 def test_increment_statements_are_counted_as_body_lines() -> None:
@@ -411,3 +422,222 @@ def test_removed_decrement_statement_is_counted() -> None:
 
     assert result.added_lines == 0
     assert result.deleted_lines == 1
+
+
+# ── FR-025(C-24): 공백 전용 변경은 변경으로 세지 않는다 ───────────────────────
+#
+# 설계 검증 기준 1~18. 판정은 "공백을 모두 제거한 시퀀스로 diff 를 한 번 더 돌린다"
+# 하나뿐이라 여기도 순수 함수·바이트 입력이다 — git 도 파일시스템도 부르지 않는다.
+
+
+def _assert_whitespace_only(result: FileDiff) -> None:
+    """FR-025 ② 가 요구하는 결과 한 벌. 케이스 1~4·9~11 이 같은 형태를 기대한다."""
+    assert result.status == "skipped"
+    assert result.skip_reason == SKIP_WHITESPACE_ONLY
+    assert result.diff_text == ""
+    assert (result.added_lines, result.deleted_lines) == (0, 0)
+    assert result.encoding is None
+
+
+# ── 기준 1: 들여쓰기만 바뀐 파일 (C-24 의 prettier 사건) ──────────────────────
+
+
+def test_indent_only_change_is_skipped_as_whitespace_only() -> None:
+    before = b"<div>\n<p>hi</p>\n</div>\n"
+    after = b"<div>\n  <p>hi</p>\n</div>\n"
+
+    _assert_whitespace_only(diff_file("10_page.html", before, after))
+
+
+# ── 기준 2: 후행 공백만 추가 ─────────────────────────────────────────────────
+
+
+def test_trailing_whitespace_only_change_is_skipped() -> None:
+    _assert_whitespace_only(diff_file("app.py", b"x = 1\ny = 2\n", b"x = 1   \ny = 2\t\n"))
+
+
+# ── 기준 3: 빈 줄 증감도 공백 전용이다 (설계 D3) ─────────────────────────────
+
+
+def test_blank_line_only_change_is_skipped() -> None:
+    # 정규화가 빈 줄을 버리지 않으면 포맷터가 넣은 빈 줄이 전부 "추가된 줄"로 세어져
+    # 필터가 실전에서 발동하지 않는다.
+    _assert_whitespace_only(diff_file("app.py", b"a = 1\nb = 2\n", b"a = 1\n\n\nb = 2\n\n"))
+
+
+# ── 기준 5: 대량 재들여쓰기 + 진짜 1줄 변경 → 본문은 전부, 숫자는 1 (③④, D2) ──
+
+
+def test_mass_reindent_with_one_real_change_keeps_full_body_but_counts_one() -> None:
+    before = "".join(f"line{index} = {index}\n" for index in range(100))
+    after = "".join(
+        f"    line{index} = {999 if index == 50 else index}\n" for index in range(100)
+    )
+
+    result = diff_file("wide.py", before.encode(), after.encode())
+
+    assert result.status == "modified"
+    # ④ 통계는 의미 있는 변경만 센다.
+    assert (result.added_lines, result.deleted_lines) == (1, 1)
+    body = _body_lines(result.diff_text)
+    # ③ 본문은 부분 삭제하지 않는다 — 재들여쓰기된 99줄도 그대로 실린다.
+    assert "+    line10 = 10" in body
+    assert "-line10 = 10" in body
+    assert len([line for line in body if line.startswith("+")]) == 100
+    assert len([line for line in body if line.startswith("-")]) == 100
+
+
+# ── 기준 7·8·8b: C-24 가 한계로 명시한 것들은 걸러지지 않는다 ─────────────────
+
+
+def test_case_change_is_not_treated_as_whitespace_only() -> None:
+    result = diff_file("index.html", b"<!DOCTYPE html>\n", b"<!doctype html>\n")
+
+    assert result.status == "modified"
+    assert result.skip_reason is None
+    assert (result.added_lines, result.deleted_lines) == (1, 1)
+
+
+def test_self_closing_tag_change_is_not_treated_as_whitespace_only() -> None:
+    result = diff_file("index.html", b'<meta charset="u">\n', b'<meta charset="u" />\n')
+
+    assert result.status == "modified"
+    assert result.skip_reason is None
+
+
+def test_line_folding_is_not_treated_as_whitespace_only() -> None:
+    # prettier 가 긴 줄을 접으면 정규화 시퀀스의 **길이**가 달라진다. 그날의 89,101자가
+    # 0 이 되지 않는 이유다 (설계 §6 반례 1).
+    before = b'<a href="x" title="y" class="z">t</a>\n'
+    after = b'<a\n  href="x"\n  title="y"\n  class="z"\n>t</a>\n'
+
+    result = diff_file("index.html", before, after)
+
+    assert result.status == "modified"
+    assert result.skip_reason is None
+    assert result.added_lines > 0
+
+
+# ── 기준 9: 줄 안의 공백만 사라져도 공백 전용이다 (FR-025 ①, 설계 §6 반례 2) ──
+
+
+def test_inline_whitespace_only_change_is_skipped() -> None:
+    _assert_whitespace_only(diff_file("app.py", b"foo(a, b)\n", b"foo(a,b)\n"))
+
+
+# ── 기준 10: BOM 만 붙은 파일 — 디코드 이후에 판정한다 (FR-022 뒤) ────────────
+
+
+def test_bom_only_addition_is_skipped_as_whitespace_only() -> None:
+    _assert_whitespace_only(diff_file("bom.py", b"x = 1\n", BOM + b"x = 1\n"))
+
+
+# ── 기준 11: 공백뿐인 신규 파일 (baseline=None) ──────────────────────────────
+
+
+def test_new_file_with_only_whitespace_is_skipped() -> None:
+    _assert_whitespace_only(diff_file("empty.py", None, b"   \n\n\t\n"))
+
+
+# ── 기준 13·14·15: 하류 소비자가 새 사유를 코드 변경 없이 흘린다 ──────────────
+
+
+def test_whitespace_only_file_is_excluded_from_totals_and_rendered_as_skip() -> None:
+    result = build_result(
+        [
+            diff_file("edit.py", b"x = 1\n", b"x = 2\n"),
+            diff_file("style.html", b"<p>a</p>\n", b"  <p>a</p>\n"),
+        ]
+    )
+
+    assert result.files_changed == 1
+    assert (result.added_lines, result.deleted_lines) == (1, 1)
+    assert [item.rel_path for item in result.skipped] == ["style.html"]
+    assert "# skipped: style.html (whitespace_only)\n" in render_final_diff(result)
+    doc = stats_doc(result, event_count=2, started_at="s", ended_at="e")
+    files = doc["files"]
+    assert isinstance(files, list)
+    assert {entry["path"]: entry["skip_reason"] for entry in files} == {
+        "edit.py": None,
+        "style.html": SKIP_WHITESPACE_ONLY,
+    }
+    totals = doc["totals"]
+    assert isinstance(totals, dict)
+    assert totals["skipped"] == 1
+    statuses = {"edit.py": "modified", "style.html": "modified"}
+    assert watched_file_entries(statuses, result) == [
+        {"path": "edit.py", "status": "modified"},
+        {"path": "style.html", "status": "skipped", "reason": SKIP_WHITESPACE_ONLY},
+    ]
+
+
+# ── 기준 16·17: 전 파일이 공백 전용인 스냅샷 → +/- 0줄, 두 번 돌려도 같은 바이트 ──
+
+
+def test_all_whitespace_session_produces_no_diff_lines_and_is_deterministic(
+    tmp_path: Path,
+) -> None:
+    paths = _snapshot_paths(tmp_path)
+    (paths.baseline_dir / "a.html").write_bytes(b"<p>a</p>\n")
+    (paths.final_dir / "a.html").write_bytes(b"    <p>a</p>\n")
+    (paths.baseline_dir / "b.py").write_bytes(b"x = 1\n")
+    (paths.final_dir / "b.py").write_bytes(b"x = 1\n\n")
+    statuses = {"a.html": "modified", "b.py": "modified"}
+
+    result = generate_session_diff(
+        paths, statuses, event_count=2, started_at="s", ended_at="e"
+    )
+
+    assert result.files_changed == 0
+    assert len(result.skipped) == 2
+    first = paths.final_diff.read_bytes()
+    body = paths.final_diff.read_text(encoding="utf-8").splitlines()
+    assert body == [
+        "# skipped: a.html (whitespace_only)",
+        "# skipped: b.py (whitespace_only)",
+    ]
+    assert not [line for line in body if line.startswith(("+", "-"))]
+    stats = json.loads(paths.stats_json.read_text(encoding="utf-8"))
+    assert stats["totals"] == {
+        "files_changed": 0,
+        "added_lines": 0,
+        "deleted_lines": 0,
+        "skipped": 2,
+    }
+    # FR-020 결정성: 같은 스냅샷을 다시 돌려도 바이트가 같다.
+    generate_session_diff(paths, statuses, event_count=2, started_at="s", ended_at="e")
+    assert paths.final_diff.read_bytes() == first
+
+
+# ── 기준 18: 순수 함수 단위 — 공백의 정의는 str.split() 에 위임한다 (D4) ──────
+
+
+def test_strip_all_whitespace_removes_inner_and_unicode_spaces() -> None:
+    assert strip_all_whitespace("  a  b\t") == "ab"
+    assert strip_all_whitespace("") == ""
+    # NBSP(U+00A0)·이데오그래픽 스페이스(U+3000)는 str.split() 이 공백으로 본다.
+    assert strip_all_whitespace("a b") == "ab"
+    assert strip_all_whitespace("a　b") == "ab"
+    # ZWSP(U+200B)는 isspace() 가 False 라 남는다 — 필터의 실제 경계다 (D4).
+    assert strip_all_whitespace("a​b") == "a​b"
+
+
+def test_normalized_lines_drops_blank_lines_and_normalizes_newlines() -> None:
+    assert normalized_lines("a\r\n\n  b  \n") == ["a", "b"]
+    assert normalized_lines("") == []
+    assert normalized_lines("  \n\t\n") == []
+
+
+def test_meaningful_line_counts_ignores_whitespace_and_counts_real_lines() -> None:
+    assert meaningful_line_counts("a\nb\n", "  a\n\tb\n\n") == (0, 0)
+    assert meaningful_line_counts("a\nb\n", "a\nc\n") == (1, 1)
+    assert meaningful_line_counts("", "a\nb\n") == (2, 0)
+    assert meaningful_line_counts("a\nb\n", "") == (0, 2)
+    # ++/-- 로 시작하는 본문 라인이 헤더로 오인되지 않는다 (위치 기준 스킵).
+    assert meaningful_line_counts("int i = 0;\n", "int i = 0;\n++i;\n") == (1, 0)
+
+
+def test_is_whitespace_only_change_is_true_only_for_zero_counts() -> None:
+    assert is_whitespace_only_change("a\nb\n", "   a\n\n b \n") is True
+    assert is_whitespace_only_change("", "") is True
+    assert is_whitespace_only_change("a\n", "a\nb\n") is False

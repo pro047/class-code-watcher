@@ -209,6 +209,10 @@ def run_watch(
         _emit_error("       탐지 위치는 redaction.json 을 확인하세요.", secrets)
         _emit_error(f"       세션 산출물은 보존됩니다: {paths.root}", secrets)
         return EXIT_RUNTIME
+    if outcome.no_meaningful_change:
+        # 해시로는 바뀌었지만 diff 기준 변경이 0개다. 아무것도 안 한 것이 정답인 세션이다.
+        _emit(f"[DONE] 의미 있는 변경이 없어 요약과 전송을 생략했습니다: {paths.root}", secrets)
+        return EXIT_OK
     if outcome.summary_state == SUMMARY_DRY_RUN:
         # PRD 10.2: dry-run 은 프롬프트까지 검증하면 할 일이 끝난 것이다.
         _emit(f"[DONE] dry-run 으로 프롬프트까지 검증했습니다: {paths.root}", secrets)

@@ -21,7 +21,8 @@ from watchdog.events import (
 
 from class_watcher import cli, notify, snapshot, summarize, watcher
 from class_watcher.config import DEFAULT_EXCLUDE, Secrets, WatchConfig
-from class_watcher.debounce import Debouncer, RawEvent
+from class_watcher.debounce import Debouncer, EventKind, RawEvent
+from class_watcher.diffgen import build_result, diff_file
 from class_watcher.notify import DeliveryOutcome, DiscordRequestError, find_diff_lines
 from class_watcher.selector import Selection, is_watched, scan_files
 from class_watcher.session import (
@@ -42,6 +43,7 @@ from class_watcher.summarize import (
 from class_watcher.watcher import (
     WatchOutcome,
     compute_statuses,
+    is_diff_empty,
     is_no_change,
     resolve_session_end,
     resolve_summary_state,
@@ -418,6 +420,11 @@ def test_binary_only_change_is_skipped_but_not_no_change(
     # 산출물만 봐도 제외 사실이 남는다 (PRD 9.2 skipped 예시와 같은 형태).
     assert paths.final_diff.read_text(encoding="utf-8") == "# skipped: a.py (binary)\n"
     assert "[DIFF] 0개 파일 변경 (+0 / -0), 1개 건너뜀(binary)" in lines
+    # C-24 이후(설계 케이스 37): diff 기준 변경이 0개인 세션은 요약·전송을 건너뛴 채
+    # completed 로 끝난다. 위 5개 단언은 그대로다 — 기록되는 사실은 안 바뀐다.
+    assert doc["status"] == "completed"
+    assert "error" not in doc
+    assert doc["openai"] == {"calls": 0, "retries": 0, "model": None, "request_id": None}
 
 
 def test_diff_failure_logs_error_and_keeps_session(
@@ -1864,6 +1871,26 @@ def _delivery_failed(error: str, http_status: int | None = None) -> DeliveryOutc
             },
             (SessionStatus.PARTIAL, "openai_timeout"),
         ),
+        # ── C-24: diff 기준 변경 0개는 성공적 생략이다 (설계 케이스 38) ─────────
+        # summary_state 는 not_run 인 채로 completed 가 된다 — 이 행이 없으면
+        # SUMMARY_NOT_RUN 이 아래 분기로 흘러 partial 이 된다.
+        ({"no_meaningful_change": True}, (SessionStatus.COMPLETED, None)),
+        (
+            {
+                "no_meaningful_change": True,
+                "discord": notify.skipped_delivery(notify.SKIP_NO_CHANGE),
+            },
+            (SessionStatus.COMPLETED, None),
+        ),
+        # 우선순위: 비밀값 차단·diff 실패가 새 갈래보다 앞선다 (DECISION 제약).
+        (
+            {"no_meaningful_change": True, "secrets_blocked": True},
+            (SessionStatus.FAILED, "secrets_detected"),
+        ),
+        (
+            {"no_meaningful_change": True, "diff_failed": True},
+            (SessionStatus.PARTIAL, "diff_failed"),
+        ),
     ],
 )
 def test_resolve_session_end_matches_design_table(
@@ -1874,6 +1901,7 @@ def test_resolve_session_end_matches_design_table(
         "secrets_blocked": False,
         "diff_failed": False,
         "redaction_failed": False,
+        "no_meaningful_change": False,
         "summary_state": "not_run",
         "summary_error": None,
         "no_discord": False,
@@ -1985,3 +2013,252 @@ def test_run_watch_maps_summary_state_to_exit_code(
     # 기준 23: 새 콘솔 문자열 전부 cp949 콘솔에서 안 깨진다 (HANDOFF (다) 재발 방지).
     captured.out.encode("cp949")
     captured.err.encode("cp949")
+
+
+# ── FR-018(C-25) 배선: 억제된 알림은 아무 흔적도 남기지 않는다 ────────────────
+#
+# 설계 검증 기준 27~32. _script_loop 가 watchdog 없이 Debouncer 에 직접 RawEvent 를
+# 먹이므로 OS 이벤트 없이 결정적으로 돈다. step 하나가 debounce 창 하나다 —
+# run_session 루프가 step 마다 due() 를 돌리기 때문이다.
+
+
+def _event_only(rel_path: str, kind: EventKind = "modified") -> Step:
+    """파일은 건드리지 않고 알림만 만든다 — C-25 의 atime 오탐 모양."""
+
+    def step(debouncer: Debouncer) -> None:
+        debouncer.observe(RawEvent(rel_path=rel_path, kind=kind, at=0.0))
+
+    return step
+
+
+def _write_and_notify(root: Path, rel_path: str, data: bytes) -> Step:
+    def step(debouncer: Debouncer) -> None:
+        (root / rel_path).write_bytes(data)
+        debouncer.observe(RawEvent(rel_path=rel_path, kind="modified", at=0.0))
+
+    return step
+
+
+def _event_rows(paths: SessionPaths) -> list[dict[str, object]]:
+    if not paths.events_jsonl.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in paths.events_jsonl.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def test_read_only_notifications_are_not_recorded_at_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 기준 27 (C-25 재현): 파일을 읽기만 한 뒤 알림 3건이 와도 논리 이벤트는 0건이다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_event_only("a.py") for _ in range(3)])
+    lines: list[str] = []
+
+    outcome = run_session(config, paths, selection, lines.append, NO_SECRETS)
+
+    assert outcome.logical_event_count == 0
+    assert _event_rows(paths) == []
+    assert not paths.events_jsonl.exists()
+    # 콘솔에도 안 찍힌다 — 사람이 "변경 감지"를 보고 오해하는 것까지 막는다.
+    assert not [line for line in lines if "변경 감지" in line]
+    doc = _session_doc(paths)
+    assert doc["status"] == "completed"
+    assert doc["no_change"] is True
+    assert doc["change_stats"] == {"files_changed": 0, "events": 0}
+
+
+def test_resaving_identical_content_records_only_the_real_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 기준 28: 진짜 변경 1회 뒤에 온 같은 내용 알림 2건은 직전 기록값과 같아 버려진다.
+    config, paths, selection = _setup_session(tmp_path)
+    steps = [
+        _write_and_notify(config.watch_root, "a.py", b"x = 2\n"),
+        _event_only("a.py"),
+        _event_only("a.py"),
+    ]
+    _script_loop(monkeypatch, steps)
+
+    outcome = run_session(config, paths, selection, lambda line: None, NO_SECRETS)
+
+    assert outcome.logical_event_count == 1
+    rows = _event_rows(paths)
+    assert [row["hash"] for row in rows] == [snapshot.hash_bytes(b"x = 2\n")]
+
+
+def test_reverting_to_baseline_content_is_still_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 기준 29 (설계 D6): 대조 기준은 baseline 이 아니라 **직전 기록값**이다. 되돌린
+    # 저장을 baseline 과 비교해 버리면 로그에서 사라진다.
+    config, paths, selection = _setup_session(tmp_path)
+    steps = [
+        _write_and_notify(config.watch_root, "a.py", b"x = 2\n"),
+        _write_and_notify(config.watch_root, "a.py", b"x = 1\n"),
+    ]
+    _script_loop(monkeypatch, steps)
+
+    outcome = run_session(config, paths, selection, lambda line: None, NO_SECRETS)
+
+    assert outcome.logical_event_count == 2
+    rows = _event_rows(paths)
+    assert [row["hash"] for row in rows] == [
+        snapshot.hash_bytes(b"x = 2\n"),
+        snapshot.hash_bytes(b"x = 1\n"),
+    ]
+    # 세션 전체로는 내용이 baseline 과 같아 변경 없음이다 — 두 사실이 따로 남는다.
+    assert outcome.no_change is True
+
+
+def test_delete_then_restore_records_both_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 기준 31 (설계 D6): 삭제를 None 으로 명시 기록하지 않으면 복원이 baseline 과 같아
+    # 삼켜지고, 로그에는 삭제만 남는다. 두 step 은 서로 다른 debounce 창이다.
+    config, paths, selection = _setup_session(tmp_path)
+    root = config.watch_root
+
+    def remove(debouncer: Debouncer) -> None:
+        (root / "a.py").unlink()
+        debouncer.observe(RawEvent(rel_path="a.py", kind="deleted", at=0.0))
+
+    _script_loop(monkeypatch, [remove, _write_and_notify(root, "a.py", b"x = 1\n")])
+
+    outcome = run_session(config, paths, selection, lambda line: None, NO_SECRETS)
+
+    assert outcome.logical_event_count == 2
+    rows = _event_rows(paths)
+    assert [row["event_type"] for row in rows] == ["deleted", "modified"]
+    assert rows[0]["hash"] is None
+    assert rows[1]["hash"] == snapshot.hash_bytes(b"x = 1\n")
+
+
+def test_history_slot_is_not_created_for_suppressed_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 기준 32: --history 세션에서도 억제된 이벤트는 슬롯을 만들지 않는다.
+    config, paths, selection = _setup_session(tmp_path, history=True)
+    steps = [
+        _write_and_notify(config.watch_root, "a.py", b"x = 2\n"),
+        _event_only("a.py"),
+    ]
+    _script_loop(monkeypatch, steps)
+
+    run_session(config, paths, selection, lambda line: None, NO_SECRETS)
+
+    assert (paths.history_dir / "0001" / "a.py").read_bytes() == b"x = 2\n"
+    assert not (paths.history_dir / "0002").exists()
+
+
+# ── FR-025(C-24) 세션 게이트: diff 기준 변경 0개면 요약·전송을 건너뛴다 ────────
+#
+# 설계 검증 기준 33~36·39. 두 축(no_change=해시 기준 / no_meaningful_change=diff 기준)이
+# 섞이지 않는 것이 이 절의 전부다.
+
+
+def test_is_diff_empty_separates_failure_from_emptiness() -> None:
+    # 기준 33: diff 생성 실패(None)를 "변경 없음"으로 바꾸면 PARTIAL 이 COMPLETED 로
+    # 위장한다.
+    assert is_diff_empty(None) is False
+    assert is_diff_empty(build_result([])) is True
+    assert is_diff_empty(build_result([diff_file("a.py", b"1\n", b"2\n")])) is False
+    # 공백 전용만 남은 결과도 diff 기준으로는 비어 있다.
+    assert is_diff_empty(build_result([diff_file("a.py", b"1\n", b" 1 \n")])) is True
+
+
+def _reindent_a_py(root: Path) -> Step:
+    return _write_and_notify(root, "a.py", b"    x = 1\n")
+
+
+def test_whitespace_only_session_completes_without_calling_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 기준 34·35·39 · 불변식 (FR-030/035/036/051): 공백 전용 변경만 있는 세션은
+    # OpenAI 0회 · Discord 0회 · payload 미생성으로 끝나고, 그런데도 completed 다.
+    config, paths, selection = _setup_session(tmp_path)
+    _script_loop(monkeypatch, [_reindent_a_py(config.watch_root)])
+    _forbid_caller(monkeypatch)
+    _forbid_sender(monkeypatch)
+    lines: list[str] = []
+
+    outcome = run_session(config, paths, selection, lines.append, WITH_DISCORD)
+
+    assert outcome.no_meaningful_change is True
+    # 해시로는 바뀐 세션이다 — 두 축을 섞지 않는다.
+    assert outcome.no_change is False
+    assert outcome.summary_state == watcher.SUMMARY_NOT_RUN
+    doc = _session_doc(paths)
+    assert doc["status"] == "completed"
+    # 정제를 "안 한 것"이 실패로 세어지면 여기에 redaction_failed 가 남는다 (기준 39).
+    assert "error" not in doc
+    assert doc["no_change"] is False
+    assert doc["watched_files"] == [
+        {"path": "a.py", "status": "skipped", "reason": "whitespace_only"}
+    ]
+    assert doc["change_stats"] == {
+        "files_changed": 0,
+        "events": 1,
+        "added_lines": 0,
+        "deleted_lines": 0,
+    }
+    assert doc["openai"] == {"calls": 0, "retries": 0, "model": None, "request_id": None}
+    assert doc["discord"] == {
+        "delivered": False,
+        "http_status": None,
+        "requests": 0,
+        "chunks": 0,
+        "skip_reason": notify.SKIP_NO_CHANGE,
+    }
+    # 로컬 산출물은 남는다 (PRD 12절). 외부로 나갈 것만 안 만든다.
+    assert paths.final_diff.read_text(encoding="utf-8") == "# skipped: a.py (whitespace_only)\n"
+    assert paths.stats_json.exists()
+    assert (paths.final_dir / "a.py").read_bytes() == b"    x = 1\n"
+    # 스캔도 요약도 건너뛴다 (설계 D10) — 나가는 것이 없으니 검사할 대상도 없다.
+    assert not paths.redaction_json.exists()
+    assert "redaction" not in doc
+    assert not paths.summary_json.exists()
+    assert not paths.discord_payload_json.exists()
+    assert "[SKIP] 의미 있는 변경이 없어 요약과 전송을 생략합니다." in lines
+
+
+def test_mixed_session_still_summarizes_and_delivers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 기준 36 (게이트 오작동 회귀): 공백 전용 파일이 섞여 있어도 진짜 변경이 하나라도
+    # 있으면 평소 경로다. 이 테스트가 깨지면 게이트가 정상 세션을 삼키고 있는 것이다.
+    config, paths, selection = _setup_session(tmp_path, no_discord=True)
+    root = config.watch_root
+
+    def change(debouncer: Debouncer) -> None:
+        (root / "a.py").write_bytes(b"    x = 1\n")
+        (root / "b.py").write_bytes(b"y = 2\n")
+        debouncer.observe(RawEvent(rel_path="a.py", kind="modified", at=0.0))
+        debouncer.observe(RawEvent(rel_path="b.py", kind="created", at=0.0))
+
+    _script_loop(monkeypatch, [change])
+    caller = _FakeCaller([VALID_SUMMARY_TEXT])
+    monkeypatch.setattr(watcher, "make_openai_caller", caller.factory)
+    _forbid_sender(monkeypatch)
+
+    outcome = run_session(config, paths, selection, lambda line: None, WITH_DISCORD)
+
+    assert outcome.no_meaningful_change is False
+    assert len(caller.prompts) == 1  # 정상 경로 1회 (FR-030)
+    assert outcome.summary_state == watcher.SUMMARY_OK
+    doc = _session_doc(paths)
+    assert doc["status"] == "completed"
+    assert doc["change_stats"] == {
+        "files_changed": 1,
+        "events": 2,
+        "added_lines": 1,
+        "deleted_lines": 0,
+    }
+    assert doc["watched_files"] == [
+        {"path": "a.py", "status": "skipped", "reason": "whitespace_only"},
+        {"path": "b.py", "status": "added"},
+    ]
+    # 정제는 이 경로에서 정상적으로 돈다 (FR-036 방어선은 그대로다).
+    assert paths.redaction_json.exists()
+    assert paths.summary_json.exists()

@@ -37,7 +37,7 @@ from .diffgen import (
     watched_file_entries,
 )
 from .discord_client import make_discord_sender
-from .eventlog import append_jsonl, event_row
+from .eventlog import append_jsonl, event_row, previous_hash, should_record
 from .notify import (
     DISCORD_NOT_RUN,
     ERROR_DISCORD_NOT_ATTEMPTED,
@@ -130,6 +130,8 @@ class WatchOutcome:
     secrets_blocked: bool = False
     summary_state: str = SUMMARY_NOT_RUN
     discord_state: str = DISCORD_NOT_RUN
+    # diff 기준 변경 파일이 0개라 요약·전송을 생략한 세션 (해시 기준 no_change 와 별개 축).
+    no_meaningful_change: bool = False
 
 
 def compute_statuses(
@@ -164,6 +166,16 @@ def is_no_change(statuses: Mapping[str, str]) -> bool:
     return all(status == STATUS_UNCHANGED for status in statuses.values())
 
 
+def is_diff_empty(result: DiffResult | None) -> bool:
+    """순수 — diff 기준 변경 파일이 0개인가.
+
+    FR-025 로 전부 걸러졌거나 FR-024 로 전부 제외된 세션이 여기 걸린다. result 가
+    None(diff 생성 실패)이면 False 다 — 실패를 "변경 없음"으로 바꾸면 PARTIAL 이어야
+    할 세션이 COMPLETED 로 위장한다.
+    """
+    return result is not None and result.files_changed == 0
+
+
 def resolve_summary_state(
     outcome: SummarizeOutcome | None, *, attempted: bool, dry_run: bool
 ) -> str:
@@ -189,6 +201,7 @@ def resolve_session_end(
     secrets_blocked: bool,
     diff_failed: bool,
     redaction_failed: bool,
+    no_meaningful_change: bool = False,
     summary_state: str,
     summary_error: str | None,
     no_discord: bool,
@@ -207,6 +220,9 @@ def resolve_session_end(
         return SessionStatus.PARTIAL, ERROR_DIFF_FAILED
     if redaction_failed:
         return SessionStatus.PARTIAL, ERROR_REDACTION_FAILED
+    if no_meaningful_change:
+        # 의미 있는 변경이 없어 요약·전송을 생략했다. 아무것도 안 한 것이 정답인 세션이다.
+        return SessionStatus.COMPLETED, None
     if summary_state == SUMMARY_DRY_RUN:
         return SessionStatus.COMPLETED, None
     if summary_error is not None:
@@ -326,6 +342,8 @@ class _Session:
         self.model = model
         self.doc: dict[str, object] = {}
         self.baseline_hashes: dict[str, str] = {}
+        # FR-018 의 "직전 기록값". 삭제는 None 으로 명시 기록한다 (D6).
+        self.recorded_hashes: dict[str, str | None] = {}
         self.observed: set[str] = set()
         self.event_count = 0
         self.history_seq = 0
@@ -335,13 +353,22 @@ class _Session:
         write_session_json(self.paths, self.doc)
 
     def handle(self, logical: LogicalEvent) -> None:
-        self.event_count += 1
-        self.observed.add(logical.rel_path)
-
         if logical.kind == "deleted":
             sha256, size = None, None
         else:
             sha256, size = _read_digest(self.config.watch_root, logical.rel_path)
+
+        previous = previous_hash(logical.rel_path, self.recorded_hashes, self.baseline_hashes)
+        if not should_record(logical.kind, sha256, previous):
+            return
+
+        if logical.kind == "deleted":
+            self.recorded_hashes[logical.rel_path] = None
+        elif sha256 is not None:
+            self.recorded_hashes[logical.rel_path] = sha256
+
+        self.event_count += 1
+        self.observed.add(logical.rel_path)
 
         append_jsonl(
             self.paths.events_jsonl,
@@ -592,7 +619,7 @@ def _run_notify(
     *,
     change_stats: Mapping[str, object],
     ended_at: str,
-    no_change: bool,
+    nothing_to_send: bool,
     secrets_blocked: bool,
 ) -> DeliveryOutcome:
     """Discord 전송 지점 (FR-033/034/050~052). 판정은 전부 notify.py 순수 함수가 한다.
@@ -601,7 +628,7 @@ def _run_notify(
     만들지 않는다 (FR-051). 전송이 아예 일어나지 않는 5갈래는 여기서 갈리고, 그중 넷은
     콘솔 출력도 기존 문구를 그대로 쓴다.
     """
-    if no_change:
+    if nothing_to_send:
         return skipped_delivery(SKIP_NO_CHANGE)
     if secrets_blocked:
         return skipped_delivery(SKIP_SECRETS_BLOCKED)
@@ -744,6 +771,7 @@ def _finalize(
 
     aborted = False
     unstable = False
+    no_meaningful_change = False
     statuses: dict[str, str] = {}
     diff_result: DiffResult | None = None
     redaction: RedactionResult | None = None
@@ -782,10 +810,14 @@ def _finalize(
         statuses = compute_statuses(state.baseline_hashes, hash_map(final))
         ended_at = datetime.now().astimezone().isoformat()
         # no_change 세션은 diff 산출물을 만들지 않는다 (FR-035 경로 불변).
-        if not is_no_change(statuses):
+        hash_no_change = is_no_change(statuses)
+        if not hash_no_change:
             diff_result = _generate_diff(state, statuses, ended_at)
-            # diff 를 못 만든 세션은 스캔할 대상 자체가 없다.
-            if diff_result is not None:
+            # diff 기준 변경 파일이 0개면 정제·요약도 건너뛴다 (FR-025, 외부로 나갈 것이 없다).
+            no_meaningful_change = is_diff_empty(diff_result)
+            if no_meaningful_change:
+                state.emit("[SKIP] 의미 있는 변경이 없어 요약과 전송을 생략합니다.")
+            elif diff_result is not None:
                 redaction = _run_redaction(state, diff_result)
                 # blocked 면 text 가 None 이라 요약 인자를 만들 수 없다 — 타입과 가드 이중으로
                 # 무호출을 보장한다 (FR-036). 요약은 정제 판정 직후, 이 try 안에 둔다.
@@ -801,7 +833,7 @@ def _finalize(
             summarize,
             change_stats=_change_stats_of(diff_result, statuses, state.event_count),
             ended_at=ended_at,
-            no_change=is_no_change(statuses),
+            nothing_to_send=hash_no_change or no_meaningful_change,
             secrets_blocked=redaction is not None and redaction.blocked,
         )
     except KeyboardInterrupt:
@@ -856,7 +888,10 @@ def _finalize(
         no_change=no_change,
         secrets_blocked=secrets_blocked,
         diff_failed=not no_change and diff_result is None,
-        redaction_failed=diff_result is not None and redaction is None,
+        redaction_failed=(
+            diff_result is not None and redaction is None and not no_meaningful_change
+        ),
+        no_meaningful_change=no_meaningful_change,
         summary_state=summary_state,
         summary_error=summarize.error if summarize is not None else None,
         no_discord=state.config.no_discord,
@@ -876,6 +911,7 @@ def _finalize(
         secrets_blocked=secrets_blocked,
         summary_state=summary_state,
         discord_state=resolve_discord_state(discord),
+        no_meaningful_change=no_meaningful_change,
     )
 
 
@@ -891,6 +927,7 @@ __all__ = [
     "DRIVE_REMOTE",
     "WatchOutcome",
     "compute_statuses",
+    "is_diff_empty",
     "is_no_change",
     "resolve_session_end",
     "resolve_summary_state",

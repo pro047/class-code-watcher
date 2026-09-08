@@ -884,8 +884,9 @@ def test_prompt_input_doc_is_shared_by_summary_and_prompt_artifacts() -> None:
 
 def test_prompt_budget_is_one_day_sized() -> None:
     # B1 (C-18): 요약 단위가 "하루 1세션"이 되면서 20,000 에서 올렸다.
-    # C-27: 60,000 은 C-18 의 `추정`이었고 2026-09-08 실측(108,957자)이 그것을 깼다.
-    assert summarize.PROMPT_DIFF_BUDGET_CHARS == 110_000
+    # C-27: 110,000 으로 올렸다가 되돌렸다 — 상한을 정하는 것은 diff 크기가 아니라
+    # 계정 TPM(30,000)이다. 60,000 짜리 호출 하나가 이미 입력 19,734 토큰을 쓴다.
+    assert summarize.PROMPT_DIFF_BUDGET_CHARS == 60_000
 
 
 def test_recorded_half_day_session_fits_the_budget_untruncated() -> None:
@@ -1284,15 +1285,22 @@ def test_largest_file_is_not_starved_by_a_smaller_one() -> None:
 
 
 def test_prompt_budget_covers_a_recorded_full_day_session() -> None:
-    """B-ii: H1 의 답 — 60,000 은 하루치에 모자란다.
+    """B-ii: H1 의 답 — 예산은 계정 TPM 이 정한다.
 
-    2026-09-08 세션이 108,957자였다. 60,000 에서는 truncated=true 였고, 실전송본에
-    `[근거 일부 누락]` 이 붙은 채 그날의 본 주제가 4/14 hunk 만 근거로 남았다.
+    하루치 diff(2026-09-08, 108,957자)는 예산보다 크다. 그렇다고 예산을 거기 맞출
+    수는 없다 — `x-ratelimit-limit-tokens` 가 30,000 이고 108,957자는 약 40,000
+    토큰이라 한 요청이 버킷을 통째로 넘는다(실측 HTTP 429). 그래서 이 테스트가
+    지키는 것은 "하루치가 다 들어간다"가 아니라 **"한 호출이 TPM 안에 있다"** 이다.
     """
-    assert summarize.PROMPT_DIFF_BUDGET_CHARS >= 108_957
+    DENSITY = 2.77  # 2026-09-08 실측: 54,667자 -> 19,734 입력 토큰
+    TPM_LIMIT = 30_000
+    fixed = 1_769  # system + user 고정부
+    assert (summarize.PROMPT_DIFF_BUDGET_CHARS + fixed) / DENSITY < TPM_LIMIT
 
-    big = _sized_file_diff("14_문서객체모델_DOM기초.html", 73_431)
-    small = _sized_file_diff("13_브라우저객체.html", 35_526)
+    # 그리고 그 예산 안에서는 변경량 1순위가 먼저 자기 몫을 가져간다 (B-i).
+    # 실세션의 모양 그대로다 — 1순위 14 hunk / 73,431자, 2순위 2 hunk / 35,526자.
+    big = _multi_hunk_diff("14_문서객체모델_DOM기초.html", hunks=14, hunk_chars=5_245)
+    small = _multi_hunk_diff("13_브라우저객체.html", hunks=2, hunk_chars=17_763)
     files = (
         _stat("14_문서객체모델_DOM기초.html", added=688, deleted=273),
         _stat("13_브라우저객체.html", added=319, deleted=62),
@@ -1300,6 +1308,8 @@ def test_prompt_budget_covers_a_recorded_full_day_session() -> None:
 
     prompt = summarize.build_prompt(_inp(diff=big + small, files=files))
 
-    assert prompt.truncated is False
-    assert prompt.omitted_files == ()
-    assert prompt.partial_files == ()
+    # 2패스에서는 이 자리가 4/14 였다. 예산은 그대로이고 배분만 고쳤다.
+    [partial] = prompt.partial_files
+    assert partial.rel_path == "14_문서객체모델_DOM기초.html"
+    assert partial.included_hunks >= 11
+    assert prompt.omitted_files == ("13_브라우저객체.html",)

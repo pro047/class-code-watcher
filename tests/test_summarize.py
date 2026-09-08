@@ -765,9 +765,13 @@ def test_single_oversized_file_is_partially_included_not_dropped() -> None:
     assert "+F" not in prompt.user
 
 
-def test_small_files_survive_whole_while_the_big_one_is_split() -> None:
-    # A8: 2패스인 이유. 1패스에 hunk 분할을 섞으면 가장 큰 파일이 남은 예산을 전부 먹어
-    # 통째로 들어갈 수 있었던 작은 파일들이 통계만 남는다 (2026-09-01 실세션의 형태).
+def test_the_biggest_file_claims_its_hunks_before_smaller_files_are_loaded() -> None:
+    # A8 (C-27 로 뒤집혔다): 이 픽스처는 원래 2패스의 근거였다 — "1패스에 hunk 분할을
+    # 섞으면 가장 큰 파일이 남은 예산을 전부 먹어 통째로 들어갈 수 있었던 작은 파일들이
+    # 통계만 남는다"(2026-09-01 실세션의 형태). 2026-09-08 세션이 그 맞교환의 반대편
+    # 대가를 보여줬다 — 변경량 1순위가 4/14 hunk 로 깎이고 요약이 부 파일 쪽으로 기울었다.
+    # PRD 11.1 원칙 6 은 「변경량 큰 순」이라고 쓰고, C-27 은 그 우선순위를 배분까지
+    # 끌고 간다. 작은 파일이 통계만 남는 것은 이제 받아들이는 대가다 — 없어진 위험이 아니다.
     big = _multi_hunk_diff("big.html", hunks=6)
     smalls = [_sized_file_diff(f"js/module{index}.js", 200) for index in range(4)]
     big_header, big_hunks = summarize.split_hunks(big)
@@ -781,14 +785,15 @@ def test_small_files_survive_whole_while_the_big_one_is_split() -> None:
         _inp(diff=big + "".join(smalls), files=files), budget_chars=budget
     )
 
-    # 작은 4개는 전량 포함된다.
-    for text in smalls:
-        assert text.rstrip("\n") in prompt.user
-    assert prompt.omitted_files == ()
+    # 1순위가 먼저 자기 몫을 가져간다 — 2패스에서는 1 hunk 였다.
     [partial] = prompt.partial_files
     assert partial.rel_path == "big.html"
-    assert partial.included_hunks == 1
+    assert partial.included_hunks == 2
     assert partial.total_hunks == 6
+    # 남은 예산에 들어가는 작은 파일까지는 그대로 실린다.
+    assert smalls[0].rstrip(chr(10)) in prompt.user
+    # 자리가 없는 나머지는 통계 줄로 떨어진다. 이것이 C-27 이 지불하는 값이다.
+    assert prompt.omitted_files == ("js/module1.js", "js/module2.js", "js/module3.js")
 
 
 def test_budget_below_every_first_hunk_falls_back_to_stats_only() -> None:
@@ -879,7 +884,8 @@ def test_prompt_input_doc_is_shared_by_summary_and_prompt_artifacts() -> None:
 
 def test_prompt_budget_is_one_day_sized() -> None:
     # B1 (C-18): 요약 단위가 "하루 1세션"이 되면서 20,000 에서 올렸다.
-    assert summarize.PROMPT_DIFF_BUDGET_CHARS == 60_000
+    # C-27: 60,000 은 C-18 의 `추정`이었고 2026-09-08 실측(108,957자)이 그것을 깼다.
+    assert summarize.PROMPT_DIFF_BUDGET_CHARS == 110_000
 
 
 def test_recorded_half_day_session_fits_the_budget_untruncated() -> None:
@@ -1217,3 +1223,83 @@ def test_emit_lines_encode_cp949_on_full_retry_path() -> None:
     assert "[AI] 재시도까지 실패. 규칙 기반 요약으로 대체합니다" in lines
     for line in lines:
         line.encode("cp949")  # 리다이렉트(cp949) 콘솔에서도 안 깨진다 (HANDOFF (다))
+
+
+# --- 2026-09-08 실수업 세션(JS DOM)이 드러낸 결함 3건 ---------------------------
+# 세션 20260908-091609-16c0: final.diff 108,957자(14_문서객체모델 73,431 + 13_브라우저객체
+# 35,526), 예산 60,000. Discord 실전송본에 `setInterval·clea` 와 `[근거 일부 누락]` 이
+# 함께 나왔다. 아래 셋은 그 세션을 재료로 한 회귀 테스트다.
+
+
+def test_series_term_is_cut_at_the_separator_not_mid_token() -> None:
+    """A: `setInterval·clearInterval`(25자)이 16자에서 토큰 한가운데로 잘렸다.
+
+    실전송본에 `setInterval·clea` 가 나갔다. C-23 이 계열을 한 항목으로 묶으라고
+    시키면서 term 은 구분자로 이어붙인 목록이 됐고, 목록을 글자 수로 자르면 마지막
+    항목이 깨진다. 구분자까지 물러나면 항목 하나를 잃는 대신 남는 것이 온전하다.
+    """
+    outcome = _validate_with_keyword(term="setInterval·clearInterval")
+
+    assert outcome.ok is True
+    assert _first_keyword(outcome)["term"] == "setInterval"
+
+
+def test_syntax_list_is_cut_at_a_slash_boundary() -> None:
+    """A: C-23 의 흠 ① — 80자 실험에서 `...getMinutes/getSeco` 로 잘렸던 그 모양."""
+    syntax = "getFullYear/getMonth/getDate/getHours/getMinutes/getSeconds/getMilliseconds"
+    assert len(syntax) > summarize.MAX_SYNTAX_CHARS
+
+    outcome = _validate_with_keyword(syntax=syntax)
+
+    entry = _first_keyword(outcome)
+    assert entry["syntax"] == "getFullYear/getMonth/getDate/getHours/getMinutes/getSeconds"
+
+
+def test_separator_too_early_falls_back_to_a_hard_cut() -> None:
+    """A: 구분자가 절반보다 앞이면 물러나지 않는다.
+
+    목록의 대부분을 버리는 것이 토큰 하나가 깨지는 것보다 나쁘다.
+    """
+    outcome = _validate_with_keyword(term="a·" + "b" * 20)
+
+    assert _first_keyword(outcome)["term"] == "a·" + "b" * 14
+
+
+def test_largest_file_is_not_starved_by_a_smaller_one() -> None:
+    """B-i: 변경량 1순위 파일이 하위 파일에게 예산을 뺏겼다 (PRD 11.1 원칙 6 위반).
+
+    실측: 1순위(961줄, 73,431자)가 4/14 hunk 만 실리고 2순위(381줄, 35,526자)가
+    통째로 들어갔다. C-18 의 2패스가 1순위를 "보류"로 빼는 사이 2순위가 예산의
+    59%를 먹기 때문이다. 원칙 6 은 「변경량 큰 순」이라고 쓴다.
+    """
+    big = _multi_hunk_diff("main.html", hunks=14, hunk_chars=5_000)
+    small = _multi_hunk_diff("side.html", hunks=2, hunk_chars=17_500)
+    files = (_stat("side.html", added=319, deleted=62), _stat("main.html", added=688, deleted=273))
+
+    prompt = summarize.build_prompt(_inp(diff=big + small, files=files), budget_chars=60_000)
+
+    partial = {item.rel_path: item.included_hunks for item in prompt.partial_files}
+    assert partial.get("main.html", 0) >= 11
+    assert "side.html" in prompt.omitted_files
+
+
+def test_prompt_budget_covers_a_recorded_full_day_session() -> None:
+    """B-ii: H1 의 답 — 60,000 은 하루치에 모자란다.
+
+    2026-09-08 세션이 108,957자였다. 60,000 에서는 truncated=true 였고, 실전송본에
+    `[근거 일부 누락]` 이 붙은 채 그날의 본 주제가 4/14 hunk 만 근거로 남았다.
+    """
+    assert summarize.PROMPT_DIFF_BUDGET_CHARS >= 108_957
+
+    big = _sized_file_diff("14_문서객체모델_DOM기초.html", 73_431)
+    small = _sized_file_diff("13_브라우저객체.html", 35_526)
+    files = (
+        _stat("14_문서객체모델_DOM기초.html", added=688, deleted=273),
+        _stat("13_브라우저객체.html", added=319, deleted=62),
+    )
+
+    prompt = summarize.build_prompt(_inp(diff=big + small, files=files))
+
+    assert prompt.truncated is False
+    assert prompt.omitted_files == ()
+    assert prompt.partial_files == ()

@@ -68,6 +68,11 @@ CONFIDENCE_FALLBACK = "low"
 # keywords[] 한 항목의 필드. 스키마의 required 와 validate_summary 의 타입 검사가
 # 이 한 튜플에서 갈라져 나온다.
 KEYWORD_ITEM_FIELDS: tuple[str, ...] = ("term", "concept", "syntax", "group", "confidence")
+# 절단이 물러날 수 있는 구분자. C-23 이 계열을 한 항목으로 묶으라고 시키면서 term 과
+# syntax 는 구분자로 이어붙인 목록이 됐고, 그 목록을 글자 수로 자르면 마지막 항목이
+# 반토막 난다 — 2026-09-08 실전송본의 `setInterval·clea` 가 그것이다.
+_TRUNCATE_SEPARATORS = "·/, "
+
 # 길이 제한이 붙는 필드만. group/confidence 는 길이가 아니라 목록으로 검사한다.
 _KEYWORD_CHAR_LIMITS: tuple[tuple[str, int], ...] = (
     ("term", MAX_TERM_CHARS),
@@ -75,10 +80,16 @@ _KEYWORD_CHAR_LIMITS: tuple[tuple[str, int], ...] = (
     ("syntax", MAX_SYNTAX_CHARS),
 )
 
-# C-18 로 요약 단위가 "하루 1세션"이 되면서 20,000 에서 올렸다 — 오전 반나절 실측이
-# 19,999자였고 하루치를 약 40,000자로 잡아 1.5배 여유를 뒀다(`추정`). 토크나이저를 붙일
-# 수 없어(의존성 게이트) 문자로 환산했고, PRD 7절의 실측 밀도 2.98자/토큰으로 약 20k
-# 토큰이다 (C-22 가 옛 "세션당 8k 토큰" 목표를 폐기하면서 나온 값). 조정은 이 한 줄로 한다.
+# 60,000 을 유지한다. C-27 이 한 번 110,000 으로 올렸다가 되돌린 값이다 — 하루치 diff
+# 가 그보다 크다는 것은 맞았지만(2026-09-08 실측 108,957자), **상한을 정하는 것은 diff
+# 크기가 아니라 계정의 분당 토큰 한도(TPM)였다.** 같은 날 실측: `x-ratelimit-limit-tokens`
+# 30,000 이고, 예산 60,000 짜리 호출 하나가 입력 19,734 토큰(밀도 2.77자/토큰)을 쓴다.
+# 110,000 이면 한 요청이 약 40,000 토큰이라 **버킷 전체를 넘어 재시도로도 통과할 수 없다**
+# — 실제로 HTTP 429 로 세 번 거절됐다. 올리려면 예산이 아니라 계정 티어를 먼저 올려야 한다.
+#
+# 알고 있어라: 이 값에서도 한 호출이 버킷의 66%를 쓴다. FR-030 의 재시도 1회가 같은 분에
+# 일어나면 합계가 30,000 을 넘어 429 가 난다 — 재시도를 살리려면 예산이 약 40,000 이어야
+# 한다. 스키마 실패가 드물어 받아들인 대가이고, 잦아지면 그때 내린다. 조정은 이 한 줄로 한다.
 PROMPT_DIFF_BUDGET_CHARS = 60_000
 
 # hunk 머리줄. per-file diff 에서 열 0 의 `@@` 는 hunk 헤더뿐이다 — 본문 라인은
@@ -470,9 +481,15 @@ def build_prompt(
 
     경로를 잃은 조각은 우선순위 최하위로 밀어 다른 파일의 예산을 먹지 않게 한다.
 
-    2패스인 이유(C-18): 1패스에 hunk 분할을 섞으면 가장 큰 파일이 남은 예산을 전부 먹어
-    통째로 들어갈 수 있었던 작은 파일들이 통계만 남는다. 먼저 온전히 들어가는 파일을
-    다 싣고, 남은 예산으로 큰 파일의 hunk 를 가져간다.
+    C-18 의 2패스를 되돌렸다 (C-27). 그 설계는 "온전히 들어가는 파일을 먼저 다 싣고
+    남은 예산으로 큰 파일의 hunk 를 가져간다"였는데, **정렬만 변경량 순이고 배분은
+    그 순서를 뒤집는다** — 1순위가 "보류"로 빠진 사이 하위 파일이 예산을 먹는다.
+    2026-09-08 세션에서 변경량 1순위(961줄)가 4/14 hunk, 2순위(381줄)가 전량이었다.
+    원칙 6 은 「변경량 큰 순」이라고 쓴다. 그래서 한 패스로 우선순위대로 배분한다.
+
+    C-18 이 막으려던 것(작은 파일이 통계만 남는다)은 이제 일어난다. 그것을 받아들이는
+    근거: 하루치 요약에서 그날의 주제는 변경량 1순위 파일이고, 부 파일을 온전히 담느라
+    주 파일의 근거를 3분의 1로 깎으면 요약이 부 파일 쪽으로 기운다 — 실제로 그랬다.
     """
     stats_by_path = {item.rel_path: item for item in inp.files}
     pieces: list[tuple[int, str, str]] = []
@@ -483,20 +500,16 @@ def build_prompt(
     pieces.sort(key=lambda item: (-item[0], item[1]))
 
     included: list[str] = []
-    oversized: list[tuple[str, str]] = []
+    omitted: list[str] = []
+    partial: list[PartialFile] = []
     used = 0
+    # 앞 조각이 예산을 다 먹어도 멈추지 않는다 — 뒤 조각의 헤더+첫 hunk 가 남은 자리에
+    # 들어갈 수 있고, 못 들어가면 통계 줄로 떨어질 뿐이다.
     for _, rel_path, text in pieces:
         if used + len(text) <= budget_chars:
             included.append(text)
             used += len(text)
-        else:
-            oversized.append((rel_path, text))
-
-    omitted: list[str] = []
-    partial: list[PartialFile] = []
-    # 앞 조각이 헤더+첫 hunk 조차 못 넣으면 예산이 남아 뒤 조각이 들어갈 수 있다.
-    # 그래서 첫 실패에서 멈추지 않고 전량을 돈다.
-    for rel_path, text in oversized:
+            continue
         body, included_hunks, total_hunks = take_hunks(text, budget_chars - used)
         if included_hunks > 0:
             included.append(body)
@@ -608,6 +621,20 @@ def clamp_keywords(
     return [item for index, item in enumerate(items) if index not in dropped]
 
 
+def _truncate_at_boundary(value: str, limit: int) -> str:
+    """limit 자로 자르되 구분자 경계까지 물러난다 — 토큰이 반으로 갈리지 않게.
+
+    물러날 자리가 limit 의 절반보다 앞이면 그냥 자른다. 구분자 없는 긴 토큰 하나를
+    반토막 내는 것은 어차피 피할 수 없고, 목록의 대부분을 버리면서까지 지킬 만한
+    것은 아니기 때문이다.
+    """
+    head = value[:limit]
+    cut = max(head.rfind(separator) for separator in _TRUNCATE_SEPARATORS)
+    if cut >= limit // 2:
+        return head[:cut].rstrip()
+    return head
+
+
 def _clamp_keyword(
     item: dict[str, object], label: str, clamped: list[str]
 ) -> dict[str, object]:
@@ -626,8 +653,10 @@ def _clamp_keyword(
     for key, limit in _KEYWORD_CHAR_LIMITS:
         value = str(result[key])
         if len(value) > limit:
-            clamped.append(f"{label}.{key}: {len(value)}자 -> {limit}자")
-            result[key] = value[:limit]
+            cut = _truncate_at_boundary(value, limit)
+            # 기록은 실제로 남은 길이다 — 구분자까지 물러나면 limit 보다 짧아진다.
+            clamped.append(f"{label}.{key}: {len(value)}자 -> {len(cut)}자")
+            result[key] = cut
     group = _fold_group(str(result["group"]))
     if group != str(result["group"]):
         clamped.append(f"{label}.group: 개행·공백 접음")

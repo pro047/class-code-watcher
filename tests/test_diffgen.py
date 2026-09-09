@@ -468,7 +468,12 @@ def test_blank_line_only_change_is_skipped() -> None:
 # ── 기준 5: 대량 재들여쓰기 + 진짜 1줄 변경 → 본문은 전부, 숫자는 1 (③④, D2) ──
 
 
-def test_mass_reindent_with_one_real_change_keeps_full_body_but_counts_one() -> None:
+def test_mass_reindent_with_one_real_change_now_emits_only_the_real_change() -> None:
+    # C-28 로 뒤집혔다. v1.8 의 FR-025 ③ 은 「공백 전용이 아닌 변경이 한 줄이라도 있으면
+    # 그 파일의 diff 는 평소대로 전부 생성한다 — 부분 삭제하지 않는다」였고 이 픽스처가
+    # 그 조항의 가드였다. 2026-09-09 실측이 대가를 보여줬다: 재들여쓰기된 99줄이 본문에
+    # 실려 diff 의 44%를 먹고 그날의 근거를 예산 밖으로 밀어냈다. 통계는 이미 1/1 을
+    # 세고 있었다 — 본문만 안 접고 있었던 것이 결함이다.
     before = "".join(f"line{index} = {index}\n" for index in range(100))
     after = "".join(
         f"    line{index} = {999 if index == 50 else index}\n" for index in range(100)
@@ -480,11 +485,9 @@ def test_mass_reindent_with_one_real_change_keeps_full_body_but_counts_one() -> 
     # ④ 통계는 의미 있는 변경만 센다.
     assert (result.added_lines, result.deleted_lines) == (1, 1)
     body = _body_lines(result.diff_text)
-    # ③ 본문은 부분 삭제하지 않는다 — 재들여쓰기된 99줄도 그대로 실린다.
-    assert "+    line10 = 10" in body
-    assert "-line10 = 10" in body
-    assert len([line for line in body if line.startswith("+")]) == 100
-    assert len([line for line in body if line.startswith("-")]) == 100
+    # ③ (C-28) 본문도 이제 통계와 같은 것을 센다. 재들여쓰기 99줄은 문맥으로 내려간다.
+    assert [line for line in body if line.startswith("+")] == ["+    line50 = 999"]
+    assert [line for line in body if line.startswith("-")] == ["-line50 = 50"]
 
 
 # ── 기준 7·8·8b: C-24 가 한계로 명시한 것들은 걸러지지 않는다 ─────────────────
@@ -641,3 +644,95 @@ def test_is_whitespace_only_change_is_true_only_for_zero_counts() -> None:
     assert is_whitespace_only_change("a\nb\n", "   a\n\n b \n") is True
     assert is_whitespace_only_change("", "") is True
     assert is_whitespace_only_change("a\n", "a\nb\n") is False
+
+
+# --- F17: 공백 전용 줄은 diff 본문에도 실리지 않는다 (2026-09-09 실측) -----------
+# C-24 는 파일 단위 판정이라, 진짜 변경이 섞인 파일에서는 재들여쓰기가 diff 에 그대로
+# 실렸다. 2026-09-09 오전 세션에서 diff 69,752자 중 공백이 만든 부피가 29,171자(44%)였고
+# 공백만 다른 줄이 +/- 양쪽에 283줄씩이었다. added_lines 는 이미 공백을 접고 세므로
+# (meaningful_line_counts) 세는 쪽과 LLM 에 보내는 쪽이 어긋나 있었다.
+
+_REINDENTED_BEFORE = """<html>
+<head>
+        .log-box {
+                color: red;
+        }
+</head>
+</html>
+"""
+
+# 들여쓰기만 prettier 스타일로 바뀌고, 마지막 규칙 하나만 내용이 바뀌었다.
+_REINDENTED_AFTER = """<html>
+  <head>
+      .log-box {
+              color: blue;
+      }
+  </head>
+</html>
+"""
+
+
+def test_whitespace_only_lines_are_not_emitted_as_changes() -> None:
+    text = diffgen.unified_diff_text("a.html", _REINDENTED_BEFORE, _REINDENTED_AFTER)
+
+    body = [
+        line
+        for line in text.splitlines()
+        if line[:1] in "+-" and line[:3] not in ("---", "+++")
+    ]
+    # 내용이 바뀐 것은 color 한 줄뿐이다 — 나머지 6줄은 들여쓰기만 달라졌다.
+    marker_and_content = [line[0] + line[1:].strip() for line in body]
+    assert marker_and_content == ["-color: red;", "+color: blue;"]
+
+
+def test_real_change_keeps_its_original_indentation() -> None:
+    text = diffgen.unified_diff_text("a.html", _REINDENTED_BEFORE, _REINDENTED_AFTER)
+
+    # 공백을 지운 채로 싣지 않는다 — 모델이 읽는 것은 코드다.
+    assert "+              color: blue;" in text
+    assert "-                color: red;" in text
+
+
+def test_context_lines_show_the_final_formatting() -> None:
+    text = diffgen.unified_diff_text("a.html", _REINDENTED_BEFORE, _REINDENTED_AFTER)
+
+    # 문맥 줄은 최종 상태를 보여준다 — baseline 의 옛 들여쓰기가 아니라.
+    lines = text.splitlines()
+    assert " " + (6 * " ") + ".log-box {" in lines      # after 의 6칸
+    assert " " + (8 * " ") + ".log-box {" not in lines  # before 의 8칸
+
+
+def test_reindentation_alone_produces_no_diff_body() -> None:
+    after = _REINDENTED_BEFORE.replace("        ", "  ")
+    assert after != _REINDENTED_BEFORE
+
+    text = diffgen.unified_diff_text("a.html", _REINDENTED_BEFORE, after)
+
+    assert text == ""
+
+
+def test_diff_body_folds_whitespace_on_the_same_basis_as_the_counts() -> None:
+    added, deleted = diffgen.meaningful_line_counts(_REINDENTED_BEFORE, _REINDENTED_AFTER)
+    text = diffgen.unified_diff_text("a.html", _REINDENTED_BEFORE, _REINDENTED_AFTER)
+
+    body_added = sum(
+        1
+        for line in text.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    body_deleted = sum(
+        1
+        for line in text.splitlines()
+        if line.startswith("-") and not line.startswith("---")
+    )
+    # F17 의 정체가 이 불일치였다: 세는 쪽은 공백을 접는데 보내는 쪽은 안 접었다.
+    # 두 값이 항상 같지는 않다 — normalized_lines 는 빈 줄을 버리고 본문은 코드
+    # 모양 때문에 싣는다. 실측(2026-09-09): 통계 (668, 264) vs 본문 (666, 293).
+    # 이 픽스처에는 빈 줄이 없어 정확히 같다.
+    # 두 값이 항상 같지는 않다 — normalized_lines 는 빈 줄을 버리고 본문은 코드
+    # 모양 때문에 싣는다. 실측(2026-09-09): 통계 (668, 264) vs 본문 (666, 293).
+    # 이 픽스처에는 빈 줄이 없어 정확히 같다.
+    # 두 값이 항상 같지는 않다 — normalized_lines 는 빈 줄을 버리고 본문은 코드
+    # 모양 때문에 싣는다. 실측(2026-09-09): 통계 (668, 264) vs 본문 (666, 293).
+    # 이 픽스처에는 빈 줄이 없어 정확히 같다.
+    assert (body_added, body_deleted) == (added, deleted)

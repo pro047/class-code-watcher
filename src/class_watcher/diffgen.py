@@ -95,22 +95,68 @@ def decode_snapshot(data: bytes) -> tuple[str, str] | None:
         return None
 
 
-def unified_diff_text(rel_path: str, before: str, after: str) -> str:
+def _format_range(start: int, stop: int) -> str:
+    """unified diff 의 범위 표기. difflib 의 비공개 _format_range_unified 와 같은 규칙이다.
+
+    길이 1 은 숫자 하나로, 길이 0 은 "범위 바로 앞 줄"로 적는 것이 unified diff 관례다.
+    직접 적는 이유는 hunk 를 우리가 만들기 때문이고(F17), 표기가 어긋나면
+    summarize.split_hunks 가 세는 hunk 와 사람이 읽는 diff 가 달라진다.
+    """
+    beginning = start + 1
+    length = stop - start
+    if length == 1:
+        return str(beginning)
+    if not length:
+        beginning -= 1
+    return f"{beginning},{length}"
+
+
+def unified_diff_text(rel_path: str, before: str, after: str, context: int = 3) -> str:
     """FR-022 의 "명시적 정규화" 쪽을 택한 diff 본문.
 
     splitlines() 로 개행을 떼면 CRLF/LF/CR 이 같은 라인 시퀀스가 되어, 에디터 설정
     차이로 개행만 바뀐 저장이 전 라인 변경으로 부풀지 않는다. 출력 개행은 \\n 고정이다.
     경로에 a/·b/ 접두만 붙여 절대 경로·사용자명이 산출물에 들어가지 않게 한다.
+
+    **공백만 다른 줄은 변경으로 싣지 않는다** (F17). 짝을 맞추는 것은 공백을 지운
+    키이고, 실제로 출력하는 것은 원본 줄이다 — `git diff -w` 와 같은 규칙이다.
+    공백을 지운 채로 실으면 모델이 읽는 것이 코드가 아니게 되므로 키와 출력을 나눈다.
+
+    2026-09-09 오전 세션이 이 함수를 고치게 했다: prettier 가 손으로 쓴 파일을 처음
+    만지면서 전체를 재들여쓰기했고, 내용이 같은 283줄이 +/- 양쪽에 실려 diff 69,752자
+    중 29,171자(44%)를 먹었다. **added_lines 는 이미 공백을 접고 세는데
+    (meaningful_line_counts) 본문만 안 접고 있었다** — 그 불일치가 결함의 정체다.
+
+    문맥 줄은 after 쪽을 싣는다. 공백만 다른 줄은 여기서 문맥이 되는데, 파일의 현재
+    모습을 보여주는 편이 옛 들여쓰기를 보여주는 것보다 낫다.
     """
-    lines = difflib.unified_diff(
-        before.splitlines(),
-        after.splitlines(),
-        fromfile=f"a/{rel_path}",
-        tofile=f"b/{rel_path}",
-        lineterm="",
+    before_lines = before.splitlines()
+    after_lines = after.splitlines()
+    matcher = difflib.SequenceMatcher(
+        None,
+        [strip_all_whitespace(line) for line in before_lines],
+        [strip_all_whitespace(line) for line in after_lines],
+        autojunk=False,
     )
-    text = "\n".join(lines)
-    return f"{text}\n" if text else ""
+    groups = list(matcher.get_grouped_opcodes(context))
+    if not groups:
+        return ""
+
+    out = [f"--- a/{rel_path}", f"+++ b/{rel_path}"]
+    for group in groups:
+        first, last = group[0], group[-1]
+        out.append(
+            f"@@ -{_format_range(first[1], last[2])} +{_format_range(first[3], last[4])} @@"
+        )
+        for tag, i1, i2, j1, j2 in group:
+            if tag == "equal":
+                out.extend(" " + line for line in after_lines[j1:j2])
+                continue
+            if tag in ("replace", "delete"):
+                out.extend("-" + line for line in before_lines[i1:i2])
+            if tag in ("replace", "insert"):
+                out.extend("+" + line for line in after_lines[j1:j2])
+    return "\n".join(out) + "\n"
 
 
 def strip_all_whitespace(line: str) -> str:

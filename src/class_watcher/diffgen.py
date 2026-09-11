@@ -23,6 +23,12 @@ SKIP_BINARY = "binary"
 SKIP_TOO_LARGE = "too_large"
 SKIP_DECODE_ERROR = "decode_error"
 SKIP_WHITESPACE_ONLY = "whitespace_only"
+SKIP_OPT_OUT = "opt_out"
+
+# 파일 맨 위 주석에 이 표식을 적으면 그 파일은 요약·전송에서 빠진다. 대소문자는 가리지 않는다.
+OPT_OUT_MARKER = "cw:skip"
+_LINE_COMMENT_PREFIXES = ("#", "//", "--")
+_BLOCK_COMMENTS = (("/*", "*/"), ("<!--", "-->"))
 
 # watcher 의 STATUS_* 와 같은 값. watcher 가 이 모듈을 부르므로 거꾸로 import 하면 순환이다.
 STATUS_ADDED = "added"
@@ -205,6 +211,42 @@ def is_whitespace_only_change(before: str, after: str) -> bool:
     return meaningful_line_counts(before, after) == (0, 0)
 
 
+def has_opt_out_marker(text: str) -> bool:
+    """파일 맨 위 주석 안에 OPT_OUT_MARKER 가 있으면 True.
+
+    빈 줄을 건너뛰고, 첫 코드 줄이 나오기 전까지 이어지는 주석만 본다. 주석 문법은
+    확장자를 따지지 않고 `#`·`//`·`--` 줄 주석과 `/* */`·`<!-- -->` 블록 주석을 모두
+    받는다 — 수업 파일은 언어가 섞여 있고, 첫 줄이 우연히 다른 언어의 주석처럼 보여도
+    표식까지 들어 있을 일은 없다. 코드 중간의 주석이나 문자열 안의 표식은 보지 않는다.
+    """
+    closer: str | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        while line:
+            if closer is not None:
+                end = line.find(closer)
+                comment = line if end < 0 else line[:end]
+                if OPT_OUT_MARKER in comment.lower():
+                    return True
+                if end < 0:
+                    break
+                line = line[end + len(closer) :].strip()
+                closer = None
+                continue
+            if line.startswith(_LINE_COMMENT_PREFIXES):
+                if OPT_OUT_MARKER in line.lower():
+                    return True
+                break
+            for opener, block_closer in _BLOCK_COMMENTS:
+                if line.startswith(opener):
+                    line = line[len(opener) :]
+                    closer = block_closer
+                    break
+            else:
+                return False
+    return False
+
+
 def _skipped(rel_path: str, reason: str) -> FileDiff:
     return FileDiff(
         rel_path=rel_path,
@@ -248,6 +290,10 @@ def diff_file(
         return _skipped(rel_path, SKIP_DECODE_ERROR)
 
     before_text, after_text = decoded_before[0], decoded_after[0]
+    # 남아 있는 쪽의 현재 모습으로 판정한다. 수업 중에 표식을 지우면 다시 요약에 들어간다.
+    if has_opt_out_marker(after_text if final is not None else before_text):
+        return _skipped(rel_path, SKIP_OPT_OUT)
+
     added, deleted = meaningful_line_counts(before_text, after_text)
     if (added, deleted) == (0, 0):
         return _skipped(rel_path, SKIP_WHITESPACE_ONLY)

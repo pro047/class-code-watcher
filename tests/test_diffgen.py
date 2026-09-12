@@ -736,3 +736,77 @@ def test_diff_body_folds_whitespace_on_the_same_basis_as_the_counts() -> None:
     # 모양 때문에 싣는다. 실측(2026-09-09): 통계 (668, 264) vs 본문 (666, 293).
     # 이 픽스처에는 빈 줄이 없어 정확히 같다.
     assert (body_added, body_deleted) == (added, deleted)
+
+
+# ── cw:skip — 파일 맨 위 주석의 표식으로 요약·전송에서 뺀다 ────────────────────
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "# cw:skip\nx = 1\n",
+        "# 연습용 CW:SKIP 입니다\nx = 1\n",
+        "\n\n   // cw:skip\nlet a = 1;\n",
+        "-- cw:skip\nSELECT 1;\n",
+        "/* cw:skip */\nint a;\n",
+        "/*\n * 오늘 연습\n * cw:skip\n */\nint a;\n",
+        "<!-- cw:skip -->\n<div></div>\n",
+        "<!--\n  cw:skip\n-->\n<div></div>\n",
+        "#!/usr/bin/env python\n# -*- coding: utf-8 -*-\n# cw:skip\nx = 1\n",
+        "/* header */ // cw:skip\nint a;\n",
+    ],
+)
+def test_opt_out_marker_in_leading_comment_is_detected(text: str) -> None:
+    assert diffgen.has_opt_out_marker(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "x = 1\n# cw:skip\n",  # 코드 뒤의 주석은 보지 않는다
+        "print('cw:skip')\n",  # 문자열 안
+        '"""cw:skip"""\nx = 1\n',  # docstring 은 주석이 아니다
+        "/* header */ int a; // cw:skip\n",
+        "# cw-skip\nx = 1\n",
+    ],
+)
+def test_opt_out_marker_elsewhere_is_ignored(text: str) -> None:
+    assert not diffgen.has_opt_out_marker(text)
+
+
+def test_opt_out_file_is_skipped_for_every_status() -> None:
+    marked = b"# cw:skip\nx = 1\n"
+    added = diff_file("a.py", None, marked)
+    modified = diff_file("a.py", b"x = 0\n", marked)
+    deleted = diff_file("a.py", marked, None)
+
+    for result in (added, modified, deleted):
+        assert (result.status, result.skip_reason) == ("skipped", diffgen.SKIP_OPT_OUT)
+        assert result.diff_text == ""
+
+
+def test_removing_the_marker_during_class_brings_the_file_back() -> None:
+    result = diff_file("a.py", b"# cw:skip\nx = 1\n", b"x = 1\ny = 2\n")
+
+    assert result.status == "modified"
+    assert result.skip_reason is None
+
+
+def test_opt_out_file_never_reaches_final_diff(tmp_path: Path) -> None:
+    paths = _snapshot_paths(tmp_path)
+    (paths.final_dir / "keep.py").write_bytes(b"x = 1\n")
+    (paths.final_dir / "scratch.py").write_bytes(b"# cw:skip\nsecret_practice = 1\n")
+
+    result = generate_session_diff(
+        paths,
+        {"keep.py": "added", "scratch.py": "added"},
+        event_count=2,
+        started_at="2026-09-11T09:00:00+09:00",
+        ended_at="2026-09-11T12:00:00+09:00",
+    )
+
+    diff_text = paths.final_diff.read_text(encoding="utf-8")
+    assert "secret_practice" not in diff_text
+    assert "# skipped: scratch.py (opt_out)" in diff_text
+    assert result.files_changed == 1

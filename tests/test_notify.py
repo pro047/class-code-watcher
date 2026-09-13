@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from class_watcher import notify
+from class_watcher import notify, summarize
 
 STARTED_AT = "2026-08-26T18:30:00+09:00"
 ENDED_AT = "2026-08-26T20:29:00+09:00"
@@ -269,6 +269,137 @@ def test_confidence_mark_is_shown_for_everything_but_high() -> None:
     assert notify.confidence_mark("medium") == " (medium)"
     assert notify.confidence_mark("low") == " (low)"
     assert notify.confidence_mark("아무거나\n+주입") == " (low)"
+
+
+# ── S1~S8: syntax 앞 기호 보존 (C-29) ────────────────────────────────────────
+#
+# 2026-09-11 「파이썬 자료형」 세션 실전송본에서 모델이 낸 syntax `+/*` 가 `/*` 로 나갔다.
+# 수신자는 그것을 C 주석 시작으로 읽는다 — 틀린 정보다. 원인은 _fold 의 lstrip("+-") 가
+# 필드 단위여서, 줄 맨 앞에 놓이지 않는 값까지 깎은 것이었다. 그래서 방어선을 필드 단위
+# 에서 줄 단위로 옮겼다. 아래 둘이 짝으로 지킨다 — S1 이 기호를 지키고 S3 이 줄을 지킨다.
+
+# 실전송본 그대로. 세션 산출물(20260911-090702-f145)은 실행 PC 에 있어 여기서는 관측된
+# 값만 옮긴다 — 파일 경로에 의존하면 이 테스트가 그 PC 밖에서 못 돈다.
+_OBSERVED_SIGN_SYNTAX = (
+    ("문자열 연산자", "+/*"),
+    ("증감 연산자", "--i"),
+    ("복합 대입", "-="),
+    ("복합 대입", "+="),
+    ("증감 연산자", "++"),
+    ("음수 표기", "-x"),
+)
+
+
+def _sign_keyword(term: str, syntax: str) -> notify.RenderKeyword:
+    return notify.RenderKeyword(
+        term=term,
+        syntax=syntax,
+        concept="앞 기호가 표기의 일부인 연산자다.",
+        group="연산자",
+        confidence="high",
+    )
+
+
+@pytest.mark.parametrize(("term", "syntax"), _OBSERVED_SIGN_SYNTAX)
+def test_syntax_keeps_its_leading_sign(term: str, syntax: str) -> None:
+    # S1. 앞 기호가 그대로 남고, 줄에는 `· {term}  {syntax}` 형식이 유지된다.
+    text = notify.render_message(_render_input(keywords=(_sign_keyword(term, syntax),)))
+
+    assert f"{notify.BULLET}{term}{notify.SYNTAX_GAP}{syntax}" in text
+    assert notify.find_diff_lines(text) == ()
+
+
+def test_guard_prefixes_a_space_to_any_line_that_starts_like_a_diff() -> None:
+    # S3. 그물이 항상 참인 단언이 아님을 고정한다 — 가드를 떼면 이 단언이 깨진다.
+    assert notify._guard_diff_line("+/*") == " +/*"
+    assert notify._guard_diff_line("- return null;") == " - return null;"
+    assert notify._guard_diff_line(f"{notify.BULLET}문자열 연산자  +/*").startswith(notify.BULLET)
+
+
+def test_sanitize_inline_keeps_signs_where_sanitize_line_drops_them() -> None:
+    # S1 의 뿌리. 두 함수가 갈리는 지점을 직접 못박는다 — 같은 입력, 다른 규칙.
+    assert notify.sanitize_inline("+/*") == "+/*"
+    assert notify.sanitize_line("+/*") == "/*"
+    # 앞 공백은 양쪽 다 없앤다. 기호만 규칙이 다르다.
+    assert notify.sanitize_inline("  -=") == "-="
+
+
+def test_sanitize_inline_folds_newlines_before_the_sign_survives() -> None:
+    # S4. 개행이 든 syntax 도 한 줄로 접히고, 접힌 뒤에도 맨 앞 기호가 남는다. 앞 기호를
+    # 넣어 두지 않으면 접기만 검사해 기호 보존을 판별하지 못한다.
+    text = notify.render_message(_render_input(keywords=(_sign_keyword("연산자", "+a\n-b"),)))
+
+    assert f"{notify.BULLET}연산자{notify.SYNTAX_GAP}+a -b" in text
+    assert notify.find_diff_lines(text) == ()
+
+
+def test_empty_term_still_keeps_the_syntax_off_the_line_start() -> None:
+    # S5. term 이 비면 syntax 가 앞으로 당겨지지만 머리표 `·` 가 여전히 앞에 있다.
+    text = notify.render_message(_render_input(keywords=(_sign_keyword("", "+/*"),)))
+
+    assert notify.find_diff_lines(text) == ()
+
+
+def test_hard_wrapped_syntax_fragment_never_opens_a_line() -> None:
+    # S6. _hard_wrap 이 syntax 를 잘라 새 줄 맨 앞에 놓아도 기존 조각 가드가 막는다.
+    pieces = notify._hard_wrap("· 연산자  " + "+" * 40, budget=12)
+
+    assert len(pieces) > 1
+    assert notify.find_diff_lines("\n".join(pieces)) == ()
+
+
+def test_other_fields_still_lose_their_leading_signs() -> None:
+    # S7. 회귀 방어. term·concept·summary·질문·확인할 점은 앞 `+`/`-` 를 계속 버린다 —
+    # 그 자리의 `- ` 는 정보가 아니라 머리표다.
+    inp = _render_input(
+        summary="- 항목 하나를 지웠다",
+        keywords=(
+            notify.RenderKeyword(
+                term="+ 더하기",
+                syntax="+",
+                concept="- 설명이다",
+                group="연산자",
+                confidence="high",
+            ),
+        ),
+        questions=("- 왜 그런가?",),
+        risks=("+ 확인할 것",),
+    )
+
+    text = notify.render_message(inp)
+
+    assert "항목 하나를 지웠다" in text
+    assert f"{notify.BULLET}더하기{notify.SYNTAX_GAP}+" in text
+    assert f"{notify.CONCEPT_INDENT}설명이다" in text
+    assert f"{notify.BULLET}왜 그런가?" in text
+    assert f"{notify.BULLET}확인할 것" in text
+    assert notify.find_diff_lines(text) == ()
+
+
+def test_sign_bearing_syntax_survives_every_delivery_stage() -> None:
+    # S8. 실세션 재생 대신 관측값으로 text·chunks·payload 세 층을 전부 통과시킨다.
+    inp = _render_input(keywords=tuple(_sign_keyword(t, x) for t, x in _OBSERVED_SIGN_SYNTAX))
+
+    plan = notify.plan_message(inp)
+    doc = notify.payload_doc(plan, generated_at="2026-09-11T18:00:00+09:00")
+    payloads = doc["payloads"]
+    assert isinstance(payloads, list)
+
+    joined = "\n".join(str(payload["content"]) for payload in payloads)  # type: ignore[index]
+    for _term, syntax in _OBSERVED_SIGN_SYNTAX:
+        assert syntax in joined
+    assert notify.find_diff_lines(plan.text) == ()
+    for chunk in plan.chunks:
+        assert notify.find_diff_lines(chunk) == ()
+
+
+def test_sign_preservation_does_not_break_the_syntax_clamp() -> None:
+    # C-27 의 경계 절단은 그대로 돈다 — 기호 보존은 clamp 앞 단계다.
+    long_syntax = "+" + "a," * 60
+    rendered = notify.sanitize_inline(long_syntax, limit=summarize.MAX_SYNTAX_CHARS)
+
+    assert rendered.startswith("+")
+    assert len(rendered) <= summarize.MAX_SYNTAX_CHARS
 
 
 # ── 동적 묶음 (PRD 11.4, C-19/C-20) ──────────────────────────────────────────

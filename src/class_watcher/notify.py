@@ -278,21 +278,45 @@ class DeliveryOutcome:
 # ── 렌더링 ────────────────────────────────────────────────────────────────────
 
 
-def _fold(text: str) -> str:
-    """개행을 공백으로 접고 앞쪽의 공백·`+`·`-` 를 없앤다.
+def _fold(text: str, *, strip_signs: bool = True) -> str:
+    """개행을 공백으로 접고 앞쪽의 공백을 없앤다. strip_signs 면 앞의 `+`·`-` 도 없앤다.
 
-    모델 문자열 하나가 렌더 결과의 정확히 한 줄이 되고, 그 줄이 diff 라인처럼 시작할 수
-    없게 만드는 곳이다 (FR-051 2단계 방어선).
+    모델 문자열 하나가 렌더 결과의 정확히 한 줄이 되게 만드는 곳이다 (FR-051 2단계
+    방어선). 줄 맨 앞에 놓이지 않는 값은 strip_signs=False 로 기호를 정보로 남기고,
+    줄이 diff 라인처럼 시작하지 않는 것은 _guard_diff_line 이 따로 지킨다 (C-29).
     """
     folded = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
-    return folded.lstrip(" \t+-").strip()
+    stripped = folded.lstrip(" \t+-") if strip_signs else folded.lstrip(" \t")
+    return stripped.strip()
 
 
-def sanitize_line(text: str, limit: int = MAX_LINE_CHARS) -> str:
-    cleaned = _fold(text)
+def _clamp(cleaned: str, limit: int) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: max(0, limit - len(TRUNCATION_MARK))] + TRUNCATION_MARK
+
+
+def sanitize_line(text: str, limit: int = MAX_LINE_CHARS) -> str:
+    """줄 맨 앞에 올 수 있는 값 전용. 앞의 `+`/`-` 는 정보가 아니라 머리표로 보고 버린다."""
+    return _clamp(_fold(text), limit)
+
+
+def sanitize_inline(text: str, limit: int = MAX_LINE_CHARS) -> str:
+    """줄 맨 앞에 **놓이지 않는** 값 전용 — 앞의 `+`/`-` 를 정보로 남긴다 (C-29).
+
+    `+/*`·`--i`·`-=`·`-x` 처럼 앞 기호가 표기의 일부인 코드 조각에 쓴다. 이 값을 줄
+    맨 앞에 두는 호출자가 생기면 _guard_diff_line 이 공백을 끼워 FR-051 을 지킨다.
+    """
+    return _clamp(_fold(text, strip_signs=False), limit)
+
+
+def _guard_diff_line(line: str) -> str:
+    """줄이 `+`/`-` 로 시작하면 공백 한 칸을 앞에 붙인다 (FR-051 3단계 방어선, C-29).
+
+    필드 단위가 아니라 줄 단위이므로 어떤 배치에서도 성립한다. 현재 렌더 형식에서는
+    정상 줄이 여기 걸리지 않는다 — 머리표 `·`, 섹션 헤더 `[…]`, 두 칸 들여쓰기뿐이다.
+    """
+    return f" {line}" if line.startswith(_DIFF_LINE_PREFIXES) else line
 
 
 def _parse_iso(value: str) -> datetime | None:
@@ -427,12 +451,13 @@ def build_render_input(
 def _keyword_lines(keyword: RenderKeyword) -> list[str]:
     """`· {term}  {syntax}` 와 두 칸 들여쓴 설명 줄 (PRD 11.4).
 
-    syntax 에도 sanitize_line 을 균일하게 건다. `--i` 처럼 +/- 로 시작하는 표기는 앞
-    기호를 잃지만, 예외를 두면 FR-051 방어선이 "렌더가 syntax 를 줄 맨 앞에 두지
-    않는다"는 배치 순서에 의존하게 된다. P0 를 배치에 걸지 않는다.
+    syntax 는 sanitize_inline 이다 — 앞의 `+`/`-` 가 표기의 일부라서 지우면 틀린 코드가
+    나간다 (`+/*` → `/*`, 09-11 실전송본). 이 값은 항상 `· {term}` 뒤에 오므로 줄 맨
+    앞이 아니고, 그래도 FR-051 이 배치에 의존하지 않게 render_message 가 줄 단위로
+    한 번 더 막는다 (C-29).
     """
     term = sanitize_line(keyword.term, limit=MAX_TERM_CHARS) + confidence_mark(keyword.confidence)
-    syntax = sanitize_line(keyword.syntax, limit=MAX_SYNTAX_CHARS)
+    syntax = sanitize_inline(keyword.syntax, limit=MAX_SYNTAX_CHARS)
     head = f"{BULLET}{term}{SYNTAX_GAP}{syntax}" if syntax else f"{BULLET}{term}"
     return [head, CONCEPT_INDENT + sanitize_line(keyword.concept, limit=MAX_CONCEPT_CHARS)]
 
@@ -473,7 +498,7 @@ def render_message(inp: RenderInput) -> str:
         lines.extend(
             f"{BULLET}{sanitize_line(risk, limit=MAX_ITEM_CHARS)}" for risk in inp.risks
         )
-    return "\n".join(lines)
+    return "\n".join(_guard_diff_line(line) for line in lines)
 
 
 def render_stats_only(

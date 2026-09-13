@@ -142,4 +142,7 @@ check(
 print("\n===RESULTS===")
 for scenario, name, ok, detail in results:
     print(json.dumps({"s": scenario, "name": name, "ok": ok, "detail": detail}, ensure_ascii=False))
-print(f"===TOTAL {sum(r[2] for r in results)}/{len(results)}===")
+passed = sum(r[2] for r in results)
+print(f"===TOTAL {passed}/{len(results)}===")
+# 종료 코드로 판정을 내보낸다. 안 그러면 27/32 여도 셸이 녹색으로 읽는다.
+sys.exit(0 if passed == len(results) else 1)

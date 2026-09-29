@@ -22,3 +22,7 @@ dist/
 
 # 실험 요약 산출물 (세션마다 새로 생긴다)
 experiments/summary_v2/out/
+
+# 문법 카드 실험 산출물·픽스처 — 수업 코드 조각이 들어 있어 로컬에만 둔다
+experiments/syntax_cards/out/
+experiments/syntax_cards/fixtures/

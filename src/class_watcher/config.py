@@ -30,7 +30,7 @@ DEFAULT_INCLUDE: tuple[str, ...] = (
     "*.go",
 )
 
-# FR-005 수용 기준이 이름으로 지목한 7종.
+# FR-005 수용 기준이 이름으로 지목한 7종 + Eclipse 워크스페이스 메타데이터 (C-31).
 DEFAULT_EXCLUDE: tuple[str, ...] = (
     "node_modules",
     ".git",
@@ -39,6 +39,7 @@ DEFAULT_EXCLUDE: tuple[str, ...] = (
     "dist",
     "__pycache__",
     ".venv",
+    ".metadata",
 )
 
 DEFAULT_MAX_FILES: int = 200

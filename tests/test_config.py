@@ -27,7 +27,7 @@ def _secrets() -> Secrets:
 def test_documented_default_constants() -> None:
     assert DEFAULT_MAX_FILES == 200
     assert DEFAULT_DEBOUNCE_MS == 750
-    # FR-005 수용 기준이 이름으로 지목한 7종.
+    # FR-005 수용 기준이 이름으로 지목한 8종 (C-31 로 .metadata 추가).
     assert DEFAULT_EXCLUDE == (
         "node_modules",
         ".git",
@@ -36,6 +36,7 @@ def test_documented_default_constants() -> None:
         "dist",
         "__pycache__",
         ".venv",
+        ".metadata",
     )
     # 설계가 확정한 기본 allowlist 16종. json·md 는 의도적으로 없다.
     assert len(DEFAULT_INCLUDE) == 16
